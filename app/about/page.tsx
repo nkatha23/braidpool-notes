@@ -5,26 +5,26 @@ import Link from "next/link"
 import Image from "next/image"
 
 export default function AboutPage() {
-  const team = [
-    {
-      name: "Sarah Wanjiku",
-      role: "CEO & Founder",
-      bio: "Former property manager with 10+ years experience in Kenyan real estate.",
-      avatar: "/african-woman-professional.jpg",
-    },
-    {
-      name: "David Kimani",
-      role: "CTO",
-      bio: "Software engineer passionate about solving local challenges with technology.",
-      avatar: "/african-man-professional.jpg",
-    },
-    {
-      name: "Grace Mutua",
-      role: "Head of Operations",
-      bio: "Operations expert focused on streamlining property management processes.",
-      avatar: "/african-woman-smiling.jpg",
-    },
-  ]
+  //const team = [
+    //{
+      //name: "Sarah Wanjiku",
+      //role: "CEO & Founder",
+      //bio: "Former property manager with 10+ years experience in Kenyan real estate.",
+      //avatar: "/african-woman-professional.jpg",
+    //},
+    //{
+      //name: "David Kimani",
+      //role: "CTO",
+      //bio: "Software engineer passionate about solving local challenges with technology.",
+      //avatar: "/african-man-professional.jpg",
+    //},
+    //{
+      //name: "Grace Mutua",
+      //role: "Head of Operations",
+      //bio: "Operations expert focused on streamlining property management processes.",
+      //avatar: "/african-woman-smiling.jpg",
+    //},
+  //]
 
   return (
     <div className="min-h-screen bg-background">
