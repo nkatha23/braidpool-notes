@@ -1,6 +1,6 @@
 # Block-Settled EDCA — Research Notes
 
-Source: github.com/zaidmstrr/braidpool-edca-research
+Source: [github.com/zaidmstrr/braidpool-edca-research](https://github.com/zaidmstrr/braidpool-edca-research)
 
 ## What is EDCA?
 

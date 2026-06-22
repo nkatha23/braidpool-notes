@@ -1,0 +1,9 @@
+[package]
+name = "BraidpoolNotes"
+version = "0.1.0"
+
+[[lean_lib]]
+name = "BraidpoolConcepts"
+
+[[lean_lib]]
+name = "EDCA"

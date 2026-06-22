@@ -1,6 +1,6 @@
 # Braidpool Stratum Layer — Scalability & Production Readiness Roadmap
 
-**Contributor:** Nkatha Kaburu (https://github.com/nkatha23)  
+**Contributor:** [Nkatha Kaburu](https://github.com/nkatha23)  
 **Duration:** 6 months  
 **Target:** Stratum V1 ready for 10,000+ concurrent miners (v0.1 data gathering phase)
 
@@ -236,10 +236,4 @@ gathering with real mining hardware.
 
 ## Context
 
-This roadmap grew out of a conversation with Zaid (braidpool maintainer) after
-BTC++ 2026. The core framing he gave: *"if you think of a big number like 10k
-active nodes, you can find the possible errors in the current code."* All five
-issues above were found by applying that lens to the existing `stratum.rs`.
-
-This roadmap is also the basis for a Btrust starter grant application for
-full-time OSS work on Braidpool over the next 6 months.
+This roadmap grew out of a conversation with @zaidmstrr (braidpool maintainer).
