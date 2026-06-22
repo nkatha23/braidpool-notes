@@ -25,6 +25,7 @@ practice/rust/          — Rust experiments and learning code
 ## Quick links
 
 - [Scalability roadmap](research/stratum/scalability-roadmap.md)
+- [Stratum protocol requirements analysis](research/stratum/protocol-requirements-analysis.md)
 - [EDCA payout notes](research/payout/edca-notes.md)
 - [Bead and DAG concepts](research/specs/bead-concepts.md)
 - [Lean 4 — core types](research/lean/BraidpoolConcepts.lean)
