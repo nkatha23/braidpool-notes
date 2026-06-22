@@ -1,4 +1,4 @@
-# Braidpool Notes — Nkatha Kaburu (@nkatha23)
+# Braidpool Notes
 
 Research notes, contribution logs, and learning resources from my work
 on Braidpool — a decentralized Bitcoin mining pool.
