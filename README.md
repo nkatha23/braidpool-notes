@@ -5,11 +5,9 @@ on Braidpool — a decentralized Bitcoin mining pool.
 
 ## About
 
-I'm a software developer and Bitcoin OSS contributor working on Braidpool
-full-time. These notes document my research, the problems I'm
+I'm a software developer and Bitcoin OSS contributor working on Braidpool. These notes document my research, the problems I'm
 investigating, and my understanding of the protocol as it develops.
 
-Active contributions: [github.com/braidpool/braidpool](https://github.com/braidpool/braidpool) (PRs [#472](https://github.com/braidpool/braidpool/pull/472), [#475](https://github.com/braidpool/braidpool/pull/475), [#477](https://github.com/braidpool/braidpool/pull/477), [#479](https://github.com/braidpool/braidpool/pull/479))
 
 ## Structure
 
@@ -22,10 +20,11 @@ contributions/          — Log of PRs, reviews, and issues
 practice/rust/          — Rust experiments and learning code
 ```
 
-## Quick links
+## links
 
 - [Scalability roadmap](research/stratum/scalability-roadmap.md)
 - [Stratum protocol requirements analysis](research/stratum/protocol-requirements-analysis.md)
+- [Other contribution areas](research/other-contribution-areas.md)
 - [EDCA payout notes](research/payout/edca-notes.md)
 - [Bead and DAG concepts](research/specs/bead-concepts.md)
 - [Lean 4 — core types](research/lean/BraidpoolConcepts.lean)
