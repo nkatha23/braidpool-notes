@@ -16,6 +16,12 @@ stratum, uncommitted metadata, consensus encoding, DB layer, test utilities.
 
 ## Open PRs
 
+### [PR #484](https://github.com/braidpool/braidpool/pull/484) — fix(stratum): cap MiningJobMap per miner to prevent unbounded memory growth
+Adds `capacity: usize` to `MiningJobMap` with monotonic-ID eviction. Adds
+`MAX_JOBS_PER_MINER = 10` constant alongside existing `MAX_CACHED_TEMPLATES = 90`.
+Updates two call sites. Adds `test_mining_job_map_eviction`.
+Notes: [miningjobmap-notes.md](../research/stratum/miningjobmap-notes.md)
+
 ### [PR #479](https://github.com/braidpool/braidpool/pull/479) — refactor(stratum): move TcpListener binding to caller
 `run_stratum_service` accepts a ready `TcpListener`. Caller binds the socket.
 Removes oneshot channel from PR #477. Consistent with `rpc_server.rs` pattern.

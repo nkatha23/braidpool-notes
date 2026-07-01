@@ -24,6 +24,7 @@ practice/rust/          — Rust experiments and learning code
 
 - [Scalability roadmap](research/stratum/scalability-roadmap.md)
 - [Stratum protocol requirements analysis](research/stratum/protocol-requirements-analysis.md)
+- [MiningJobMap — PR #484 working notes](research/stratum/miningjobmap-notes.md)
 - [Other contribution areas](research/other-contribution-areas.md)
 - [EDCA payout notes](research/payout/edca-notes.md)
 - [Bead and DAG concepts](research/specs/bead-concepts.md)

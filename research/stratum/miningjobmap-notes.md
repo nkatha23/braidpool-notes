@@ -1,0 +1,336 @@
+# MiningJobMap — Working Notes
+
+PR: [#484](https://github.com/braidpool/braidpool/pull/484)  
+Files changed: `node/src/lib.rs` (+5), `node/src/stratum.rs` (+54 / -9)
+
+---
+
+## What is a HashMap?
+
+A `HashMap<K, V>` is a data structure that stores key-value pairs and lets you
+look up a value by its key in constant time — O(1) — regardless of how many
+entries are in the map.
+
+Internally it works by running the key through a hash function to get a bucket
+index, then storing the value in that bucket. Looking up a key hashes it again
+and goes straight to the right bucket.
+
+```
+key "abc" → hash → bucket 7 → value
+key "xyz" → hash → bucket 3 → value
+```
+
+The tradeoff: a `HashMap` uses more memory than a plain list, and it never
+shrinks automatically. If you keep inserting without removing, it grows forever.
+
+---
+
+## What is MiningJobMap?
+
+`MiningJobMap` is the data structure that tracks active mining jobs for one
+downstream miner connection. Every time a new block template arrives (from a new
+Bitcoin block, or a new DAG tip), a new entry is added.
+
+It has two `HashMap`s that mirror each other:
+
+```rust
+pub struct MiningJobMap {
+    mining_jobs: HashMap<TemplateId, JobDetails>,      // template_id → full job
+    job_id_to_template: HashMap<u64, TemplateId>,      // numeric_id → template_id
+    next_job_id: u64,                                  // counter, always increasing
+    capacity: usize,                                   // NEW: max entries to keep
+}
+```
+
+### Why two maps?
+
+- **`mining_jobs`** — the actual job data, keyed by `TemplateId` (a hash of the
+  block template). This is what the server looks up when a miner submits a share.
+- **`job_id_to_template`** — a reverse index from the numeric job ID (a simple
+  counter) to the `TemplateId`. The stratum protocol sends miners a short numeric
+  ID (`mining.notify`). When the miner submits a share, they send back that
+  numeric ID. The server needs to map it back to the full `TemplateId` to find
+  the job.
+
+So the lookup path for a share submission is:
+
+```
+miner sends: job_id = 42
+  → job_id_to_template.get(42) → TemplateId("abc123...")
+  → mining_jobs.get("abc123...") → JobDetails { blocktemplate, coinbase1, ... }
+```
+
+### What does JobDetails hold?
+
+```rust
+pub struct JobDetails {
+    pub blocktemplate: BlockTemplate,         // full Bitcoin block template
+    pub coinbase1: String,                    // coinbase prefix (hex)
+    pub coinbase2: String,                    // coinbase suffix (hex)
+    pub coinbase_merkle_path: Vec<String>,    // merkle siblings (hex)
+    pub coinbase_witness_commitment: Option<Witness>,
+    pub job_sent_time: u32,                   // unix timestamp
+}
+```
+
+`BlockTemplate` itself contains `Vec<Transaction>` — the full transaction list
+for the block. See size note below.
+
+---
+
+## The Problem Before This PR
+
+There was no eviction. `next_job_id` incremented forever. Both `HashMap`s grew
+without bound. Old jobs were never removed.
+
+At Bitcoin block rate (~1 per 10 minutes): 144 entries/day per miner — slow but
+survivable.
+
+At bead rate: much worse (see source note below). The node would OOM-crash
+within hours of connecting real miners.
+
+---
+
+## How Big is Each Entry?
+
+This is where the original roadmap estimate of ~2KB was wrong.
+
+`BlockTemplate` contains `Vec<Transaction>` (the full list of transactions to
+include in the block). Looking at the actual struct:
+
+```rust
+pub struct BlockTemplate {
+    pub transactions: Vec<Transaction>,   // ← this is large
+    pub target: bitcoin::Target,
+    pub bits: bitcoin::CompactTarget,
+    pub height: bitcoin::absolute::Height,
+    // ... other fields
+}
+```
+
+In production:
+- A typical Bitcoin block has 2,000–3,000 transactions
+- A simple P2WPKH transaction is ~250 bytes
+- A 2,000-transaction block template ≈ 500KB
+
+So `~2KB per JobDetails` in the roadmap was very conservative. The real number
+per entry is closer to **100KB–500KB** depending on how full the mempool is.
+
+This makes the OOM risk much worse than the original estimate. Even at low
+job rates, a large mempool means each entry is huge.
+
+**Revised math:**
+```
+10,000 miners × 10 jobs cached × 500KB per job = 50GB at full mempool
+```
+The cap matters even more than originally thought.
+
+---
+
+## The Fix
+
+### New constant in `lib.rs` (line 28–31)
+
+```rust
+/// Maximum number of mining jobs retained per downstream miner connection.
+/// Oldest jobs are evicted on insert once this limit is reached.
+/// Miners only need the current job and a few recent ones for late share submission.
+pub const MAX_JOBS_PER_MINER: usize = 10;
+```
+
+Placed next to `MAX_CACHED_TEMPLATES = 90` which does the same thing for the
+Bitcoin template cache — same pattern, same reasoning.
+
+Why 10? A miner only needs the current job and a handful of recent ones in case
+a share arrives slightly late due to network delay. 10 is generous. Old jobs are
+stale — miners aren't supposed to be working on them.
+
+### New field in `MiningJobMap` (stratum.rs line 1190)
+
+```rust
+pub struct MiningJobMap {
+    mining_jobs: HashMap<TemplateId, JobDetails>,
+    job_id_to_template: HashMap<u64, TemplateId>,
+    next_job_id: u64,
+    capacity: usize,    // NEW
+}
+```
+
+### Updated constructor `MiningJobMap::new` (line 1193)
+
+```rust
+// Before
+pub fn new() -> Self {
+
+// After
+pub fn new(capacity: usize) -> Self {
+    Self {
+        mining_jobs: HashMap::new(),
+        job_id_to_template: HashMap::new(),
+        next_job_id: 0,
+        capacity,
+    }
+}
+```
+
+### Eviction logic in `insert_mining_job` (lines 1211–1217)
+
+```rust
+// Evict the oldest job when at capacity. next_job_id is monotonically
+// increasing so the oldest surviving job id is always (next_job_id - capacity).
+if self.job_id_to_template.len() >= self.capacity {
+    if let Some(oldest_id) = self.next_job_id.checked_sub(self.capacity as u64) {
+        if let Some((_, old_template)) = self.job_id_to_template.remove_entry(&oldest_id) {
+            self.mining_jobs.remove(&old_template);
+        }
+    }
+}
+```
+
+**Key insight:** because `next_job_id` only ever increases, you always know
+exactly which ID is the oldest still in the map. No scanning needed — it's a
+direct key lookup on both maps. O(1) eviction.
+
+The `checked_sub` prevents underflow when fewer than `capacity` jobs have been
+inserted yet (e.g. the very first job, `0 - 10` would panic without it).
+
+### Test-only helper `len` (lines 1257–1261)
+
+```rust
+#[cfg(test)]
+pub fn len(&self) -> usize {
+    self.job_id_to_template.len()
+}
+```
+
+Gated behind `#[cfg(test)]` so it's not compiled into production binaries. Used
+by the eviction test to assert map size.
+
+### Call sites updated
+
+**Production** (`run_stratum_service`, line 1854):
+```rust
+// Before
+let self_mining_map = Arc::new(Mutex::new(MiningJobMap::new()));
+
+// After
+let self_mining_map = Arc::new(Mutex::new(MiningJobMap::new(crate::MAX_JOBS_PER_MINER)));
+```
+
+**Test helper** (line 2456):
+```rust
+// Before
+Arc::new(Mutex::new(MiningJobMap::new()))
+
+// After
+Arc::new(Mutex::new(MiningJobMap::new(crate::MAX_JOBS_PER_MINER)))
+```
+
+### New test `test_mining_job_map_eviction` (lines 2617–2649)
+
+```rust
+#[tokio::test]
+async fn test_mining_job_map_eviction() {
+    let capacity = 3;
+    let mut map = MiningJobMap::new(capacity);
+
+    let make_job = || JobDetails { ... };  // minimal JobDetails
+
+    // Insert capacity+2 jobs — oldest two should be evicted
+    for i in 0..5u64 {
+        let template_id = TemplateId::from(i as u32);
+        map.insert_mining_job(template_id, make_job()).await;
+    }
+
+    // Only `capacity` jobs should remain
+    assert_eq!(map.len(), capacity);
+
+    // Oldest jobs (id 0 and 1) must be gone
+    assert!(map.get_by_job_id(0).await.is_err());
+    assert!(map.get_by_job_id(1).await.is_err());
+
+    // Most recent jobs (id 2, 3, 4) must still be present
+    assert!(map.get_by_job_id(2).await.is_ok());
+    assert!(map.get_by_job_id(3).await.is_ok());
+    assert!(map.get_by_job_id(4).await.is_ok());
+}
+```
+
+The test uses `capacity = 3` and inserts 5 jobs. It then asserts that jobs 0
+and 1 are gone and jobs 2, 3, 4 remain. This directly tests the eviction logic.
+
+---
+
+## The `debug!` vs `warn!` Question
+
+Self-review comment on the eviction log line:
+
+```rust
+debug!(evicted_job_id = %oldest_id, "Evicted oldest job from MiningJobMap");
+```
+
+**`debug!` is correct.** Eviction is expected, normal behavior — every insert
+past capacity triggers one eviction. Logging it at `warn!` would flood logs in
+normal operation.
+
+If you want to detect when capacity is *too low*, the right approach is a
+separate metric: count evictions per second and warn if the rate exceeds a
+threshold. That's a future addition, not something to do here.
+
+---
+
+## Source of the Bead Rate Claim (150ms–1000ms)
+
+The 150ms–1000ms figure comes from `docs/roadmap.md` line 31, not from code:
+
+```
+grep -n "150" ~/braidpool/docs/roadmap.md
+31: Braidpool beads will come in with a mean time between 150ms-1000ms,
+    and we need to stop whatever the mining device is doing...
+```
+
+The mathematical derivation behind it is in `braid_consensus.md` — the cohort
+time formula:
+
+```
+T_C = 1/(λx) + a · e^(a·λx)
+```
+
+where `a` ≈ 40ms (minimum global network latency at speed of light) and `λx`
+is determined by the difficulty adjustment targeting `N_B/N_C = 2.42`. At the
+optimal point with realistic hashrate and `a = 40ms`, `T_C` works out to the
+150ms–1000ms range.
+
+**The 150ms–1000ms is a design target from the spec, not a measured value.**
+There are no real miners yet. The actual bead rate at v0.1 will be measured for
+the first time when real hardware connects.
+
+This also means the "576,000 jobs/day per miner" figure in the PR description
+is a worst-case bound (1 job per 150ms = 6.67/second × 86,400 = 576,000),
+not an observed rate.
+
+### How to verify it when real miners connect
+
+Once v0.1 is running, the bead rate can be measured directly from the DAG:
+- Count beads per cohort over a time window T
+- Compute `T_C = T / N_C`
+- Compare to the 150ms–1000ms target
+
+The job delivery latency instrumentation (planned as a companion to this PR)
+will also surface how fast jobs actually arrive at the stratum layer.
+
+---
+
+## Open Questions
+
+- **Should `MAX_JOBS_PER_MINER = 10` be configurable at runtime** (e.g. via
+  `config.toml`) rather than a compile-time constant? The right value may differ
+  between high-latency WAN miners and local LAN miners.
+
+- **The `~2KB per entry` claim in the PR description is wrong** — `BlockTemplate`
+  holds the full transaction list. Should the PR description be corrected?
+  Actual size depends on mempool fullness; 100KB–500KB is more realistic.
+
+- **Stale share behavior**: if a miner submits a share for an evicted job, the
+  lookup fails. Should this increment `shares_stale` (planned for a later PR)
+  or return a distinct error?
