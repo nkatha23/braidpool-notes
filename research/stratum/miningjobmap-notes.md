@@ -321,16 +321,71 @@ will also surface how fast jobs actually arrive at the stratum layer.
 
 ---
 
-## Open Questions
+## Resolved Questions
 
-- **Should `MAX_JOBS_PER_MINER = 10` be configurable at runtime** (e.g. via
-  `config.toml`) rather than a compile-time constant? The right value may differ
-  between high-latency WAN miners and local LAN miners.
+### What is an evicted job?
 
-- **The `~2KB per entry` claim in the PR description is wrong** — `BlockTemplate`
-  holds the full transaction list. Should the PR description be corrected?
-  Actual size depends on mempool fullness; 100KB–500KB is more realistic.
+When a miner connects, the pool assigns them a sequence of jobs — job 0, job 1,
+job 2... Each job corresponds to a block template the miner should be hashing.
+When the capacity cap is hit, job 0 gets evicted to make room for job 10. The
+miner's hardware may still be working on job 0 (it takes time to exhaust the
+nonce space), but the pool has already moved on. If the miner finds a valid hash
+for job 0 and tries to submit it, the pool looks up job 0 in `MiningJobMap` —
+but it's gone. That's an evicted job share submission.
 
-- **Stale share behavior**: if a miner submits a share for an evicted job, the
-  lookup fails. Should this increment `shares_stale` (planned for a later PR)
-  or return a distinct error?
+### Should `MAX_JOBS_PER_MINER = 10` be runtime-configurable?
+
+10 is probably fine for LAN miners (low latency, fast job turnover) but a WAN
+miner with 500ms RTT might legitimately be working on older jobs. However, making
+it runtime-configurable adds complexity to `config.toml` before we even know
+what value is right. The v0.1 goal is data gathering — once we have real latency
+measurements from real miners (A4 in the roadmap), we'll know the right value.
+For now a compile-time constant is correct.
+
+**Decision:** keep as compile-time constant. Add a comment that it should be
+tuned after v0.1 data.
+
+### Should evicted job submissions increment `shares_stale`?
+
+Yes. A share submitted for an evicted job is semantically stale — the miner did
+valid proof-of-work but on a job the pool no longer considers active. The
+distinction from `shares_invalid` matters:
+
+- `shares_invalid` — wrong difficulty, bad extranonce, malformed share
+- `shares_stale` — valid PoW on a job the pool has moved past (either evicted
+  or superseded by a newer block)
+
+A `MiningJobNotFound` error on submit should map to `shares_stale`, not a
+generic error. Tracked for the share accounting PR (planned Month 2).
+
+**Questions for review club:**
+
+> **Q1 — `MAX_JOBS_PER_MINER` configurability** (`lib.rs` line 31)
+>
+> ```rust
+> pub const MAX_JOBS_PER_MINER: usize = 10;
+> ```
+>
+> This is currently a compile-time constant. A LAN miner with sub-10ms RTT will
+> never need more than a few cached jobs. A WAN miner with 300–500ms RTT might
+> legitimately still be working on an older job when it's evicted. Should this
+> be exposed in `config.toml` so operators can tune it per deployment? Or is
+> keeping it constant correct until v0.1 latency data tells us what the right
+> value actually is?
+
+> **Q2 — Evicted job share submission: `shares_stale` or distinct error?**
+> (`stratum.rs` — `mining.submit` handler, share accounting planned for Month 2)
+>
+> If a miner submits a share for a job that has been evicted from `MiningJobMap`,
+> the lookup in `job_id_to_template` returns `None` — `MiningJobNotFound`. Should
+> this be counted as `shares_stale` (valid proof-of-work on a job the pool no
+> longer holds) rather than `shares_invalid` (bad difficulty, bad extranonce,
+> malformed)? The distinction matters when diagnosing whether a miner is slow or
+> broken: a rising `stale` rate means the miner is falling behind the job rate;
+> a rising `invalid` rate means something is wrong with the miner's hashing.
+
+### PR description size claim
+
+The original `~2KB per entry` estimate was wrong — `BlockTemplate` contains
+`Vec<Transaction>` which is much larger. PR description corrected. Actual size
+is 100KB–500KB per entry depending on mempool fullness.
