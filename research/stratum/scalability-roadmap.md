@@ -24,37 +24,110 @@ The multicast implementation is the primary deliverable of this roadmap.
 
 ## Month 1 — Stratum V1 Structural Fixes (Part 1)
 
-### Issue 1 — MiningJobMap Grows Forever (OOM)
+### Issue 1 — Template Data Stored Once Per Miner Instead of Once Globally (OOM)
 
-**Location:** `stratum.rs` lines 1186–1248
+**Location:** `stratum.rs` lines 1186–1258, notify loop at line 1463
 
-`MiningJobMap` stores every job ever created with no eviction. `next_job_id`
-increments forever. At bead-rate job updates (150ms–1000ms per `braid_consensus.md`
-Eq. 7) instead of block-rate (10 minutes):
+**Status:** PR #484 closed — initial per-miner eviction approach was wrong scope.
+This documents the correct replacement.
 
-```
-10,000 miners × bead-rate jobs × ~2KB = OOM within hours
-```
+**Root cause — two layers:**
 
-Note: `lib.rs` already has `MAX_CACHED_TEMPLATES = 90` for the Bitcoin template
-cache — the job map needs the same treatment.
-
-**Fix:** Capacity-based eviction using the monotonic job ID:
+**Layer 1 — Wrong architecture (the main problem):**
+`MiningJobMap` is per-miner. Each miner connection stores its own copy of every
+`JobDetails`, and `JobDetails` contains a full `BlockTemplate` clone including
+`Vec<Transaction>` (~100–500KB with a populated mempool). The notify loop at
+line 1463 does:
 
 ```rust
-const MAX_JOBS_PER_MINER: usize = 10;
-
-if self.job_id_to_template.len() >= self.capacity {
-    if let Some(oldest_id) = numeric_job_id.checked_sub(self.capacity as u64) {
-        if let Some((_, old_template)) = self.job_id_to_template.remove(&oldest_id) {
-            self.mining_jobs.remove(&old_template);
-        }
-    }
+for (peer_addr, mining_job_arc) in self.job_map_arc.lock().await.iter() {
+    let mut template_for_job = template.clone();  // full clone per miner — ~500KB
+    let job_details = JobDetails { blocktemplate: template_for_job, ... };
+    curr_peer_mining_job_map.insert_mining_job(template_id, job_details).await;
 }
 ```
 
-**Test:** Fill the map past capacity, assert oldest entry is gone, assert memory
-usage stays flat over 24 hours with 100 miners connected.
+At 10,000 miners: `10,000 × 500KB = 5GB per new template`. At 150ms bead rate
+that's catastrophic. At any given time there are only 1–5 templates in flight
+across all miners — the same data stored 10,000 times.
+
+**Layer 2 — Vec<Transaction> paid for always, used rarely:**
+The transactions are only consumed at `handle_submit` line 675:
+```rust
+block_transactions.extend(submitted_job.blocktemplate.transactions.clone());
+```
+This only runs when a miner finds a full Bitcoin difficulty block — once per
+~10 minutes across all 10,000 miners. Yet every `JobDetails` pays 500KB for it
+on every insert.
+
+**Fix — Phase 1 (this PR):**
+
+Replace `job_map_arc: HashMap<peer_addr, MiningJobMap>` with a single
+`GlobalJobStore`. Use `Arc<JobDetails>` so all miners share one allocation:
+
+```rust
+pub struct GlobalJobStore {
+    jobs: HashMap<TemplateId, Arc<JobDetails>>,   // Arc — one allocation, N pointers
+    job_id_to_template: HashMap<u64, TemplateId>,
+    next_job_id: u64,
+    capacity: usize,                               // ~5
+}
+```
+
+Remove `job_sent_time` from `JobDetails` (it's per-miner, not per-template).
+Add per-miner job tracking to `DownstreamClient`:
+
+```rust
+// In DownstreamClient
+pub current_job_id: Option<u64>,
+pub current_template_id: Option<TemplateId>,
+pub job_received_time: Option<u32>,   // was job_sent_time, now per-miner
+```
+
+The notify loop becomes O(1) memory:
+
+```rust
+// ONE insert — template data allocated once
+let job_id = global_store.insert(template_id, Arc::new(job_details));
+
+// N miners notified — zero template clones
+for (peer_addr, client) in connections.iter_mut() {
+    send_mining_notify(peer_addr, job_id, &notification);
+    client.current_job_id = Some(job_id);
+    client.current_template_id = Some(template_id);
+    client.job_received_time = Some(now);
+}
+```
+
+Per-device expiry is automatic — `client.current_job_id` gets overwritten with
+the new job. The global store evicts by age when it exceeds capacity (~5).
+
+`Vec<Transaction>` becomes `Option<Vec<Transaction>>` in `BlockTemplate`.
+Phase 1 stores `Some(transactions)` as today — behaviour unchanged, just the
+Arc sharing removes the 10,000× duplication.
+
+Memory: `5GB → ~500KB` (five templates, one copy each, shared via Arc).
+
+**Fix — Phase 2 (future PR, after v0.1 data gathering):**
+
+Change `transactions` to `None` by default. When a valid full Bitcoin block is
+found, fetch the transactions from the existing `template_cache`
+(`Arc<Mutex<HashMap<TemplateId, Arc<ipc::client::BlockTemplate>>>>` in
+`ipc_template_consumer`). mcelrath noted "in principle we could re-request from
+cmempoold" — this is not a requirement for Phase 1. The template_cache already
+holds this data so no new system dependency is needed.
+
+Memory: `~500KB → ~5KB`.
+
+**Why not do Phase 2 now:**
+Phase 2 changes the hot path of `handle_submit` (every share submission) and
+requires validating the fallback when a template has been evicted from cache
+before the full block is found. That's a separate, careful change. Phase 1 gives
+99% of the memory win with straightforward scope.
+
+**Test:** Fill the global store past capacity, assert oldest template is evicted,
+assert Arc refcount drops to zero (no dangling miner references), assert memory
+stays flat over 24 hours with 100 miners connected.
 
 ### Issue 2 — Nested Mutex Deadlock
 
@@ -105,7 +178,7 @@ time of send — high queue depth with high latency identifies slow miners early
 Month 4–6 multicast numbers will be compared.
 
 **Deliverables:**
-- `fix(stratum): cap MiningJobMap with capacity-based eviction`
+- `refactor(stratum): replace per-miner MiningJobMap with GlobalJobStore + Arc<JobDetails>`
 - `refactor(stratum): replace nested mutex with DashMap + AtomicU64`
 - `fix(stratum): instrument job delivery latency per miner`
 
@@ -634,7 +707,7 @@ Write a technical recommendation on FEC for roadmap v0.7:
 
 | Month | Primary | Secondary | PRs |
 |-------|---------|-----------|-----|
-| 1 | Job map cap + DashMap | Latency instrumentation | 3 |
+| 1 | GlobalJobStore + Arc sharing + DashMap | Latency instrumentation | 3 |
 | 2 | Connection limit + cleanup + backpressure | Coinbase size + share counters | 4 |
 | 3 | Multicast protocol design + load generator | Protocol spec doc | 1 PR + 1 doc |
 | 4 | UDP broadcaster + subscribe extension + nonce subdivision | Multicast receiver for tests | 4 |
