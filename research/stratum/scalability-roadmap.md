@@ -288,11 +288,41 @@ struct ShareCounters {
 Log on disconnect and every 10 minutes. `stale` rate is a leading indicator
 of Issue 5 backpressure — a miner with rising stale rate is falling behind.
 
+### A2b — Lazy Transaction Fetch (Phase 2 of Issue 1)
+
+**Depends on:** Issue 1 (GlobalJobStore) merged and v0.1 data showing residual
+memory matters.
+
+After Issue 1, `GlobalJobStore` holds `Option<Vec<Transaction>>` set to
+`Some(...)`. This follow-up changes it to `None` by default. When a miner finds
+a full Bitcoin difficulty block, transactions are fetched from the existing
+`template_cache` (`Arc<Mutex<HashMap<TemplateId, Arc<ipc::client::BlockTemplate>>>>`
+in `ipc_template_consumer`) using the `template_id` stored in `DownstreamClient`.
+
+```rust
+// handle_submit — only when PoW meets full Bitcoin target
+let transactions = match global_store.get_transactions(template_id) {
+    Some(txs) => txs,
+    None => {
+        // look up from ipc template_cache — already in memory, no network call
+        template_cache.lock().await
+            .get(&template_id)
+            .map(|t| t.transactions.clone())
+            .ok_or(StratumErrors::TemplateEvicted { template_id })?
+    }
+};
+```
+
+Memory: `~500KB → ~5KB`. No cmempoold dependency — the template_cache is
+already present. mcelrath mentioned cmempoold as an option but the cache is
+sufficient for v0.1.
+
 **Deliverables:**
 - `fix(stratum): add MAX_DOWNSTREAM_CONNECTIONS with metric logging`
 - `fix(stratum): guarantee cleanup via ConnectionGuard`
 - `fix(stratum): slow miner backpressure with clean_jobs coordination`
 - `fix(stratum): coinbase size limit enforcement + per-miner share counters`
+- `refactor(stratum): lazy transaction fetch via template_cache (Phase 2 of Issue 1)` *(if v0.1 data warrants it)*
 
 ---
 
