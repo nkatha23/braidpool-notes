@@ -14,17 +14,34 @@ Added oneshot channel to `run_stratum_service` for tests to discover bound port.
 Extends both extranonce fields from `u32` to `u64`. Propagates through
 stratum, uncommitted metadata, consensus encoding, DB layer, test utilities.
 
-## Open PRs
-
-### [PR #484](https://github.com/braidpool/braidpool/pull/484) — fix(stratum): cap MiningJobMap per miner to prevent unbounded memory growth
-Adds `capacity: usize` to `MiningJobMap` with monotonic-ID eviction. Adds
-`MAX_JOBS_PER_MINER = 10` constant alongside existing `MAX_CACHED_TEMPLATES = 90`.
-Updates two call sites. Adds `test_mining_job_map_eviction`.
-Notes: [miningjobmap-notes.md](../research/stratum/miningjobmap-notes.md)
-
 ### [PR #479](https://github.com/braidpool/braidpool/pull/479) — refactor(stratum): move TcpListener binding to caller
 `run_stratum_service` accepts a ready `TcpListener`. Caller binds the socket.
-Removes oneshot channel from PR #477. Consistent with `rpc_server.rs` pattern.
+Removes `port` field from `StratumServerConfig` (no longer used inside the
+server). Removes oneshot channel from PR #477 — tests call `local_addr()`
+directly before spawning. Consistent with `rpc_server.rs` pattern.
+Reviewed by Zaid (Code ACK c4e89d2), merged by Zaid into dev.
+
+## Open PRs
+
+### [PR #492](https://github.com/braidpool/braidpool/pull/492) — refactor(stratum): replace per-miner MiningJobMap with GlobalJobStore
+Replaces all per-miner `MiningJobMap`s with a single `GlobalJobStore` shared
+across all connections via `Arc<Mutex<GlobalJobStore>>`. `JobDetails` is
+`Arc`-wrapped — one allocation shared by all miners, zero template clones on
+notify. `insert()` uses `entry().or_insert()` to reuse existing `Arc` for
+duplicate `template_id`s. `latest_job_id_for()` prevents churn eviction by
+reusing existing `job_id` on miner reconnect. Combined `get()` replaces double
+lookup. `GLOBAL_JOB_STORE_CAPACITY = 5` (~750 ms retention at bead rate).
+6 new unit tests. Memory: ~5 GB → ~500 KB at 10k connections.
+Supersedes closed PR #484.
+
+## Closed / Superseded PRs
+
+### [PR #484](https://github.com/braidpool/braidpool/pull/484) — fix(stratum): cap MiningJobMap per miner (closed, superseded by #492)
+Added `capacity: usize` to `MiningJobMap` with monotonic-ID eviction. Closed
+after mcelrath review identified that evicting by `template_id` silently
+invalidated other `job_id`s pointing at the same template. The correct fix
+required replacing the per-miner architecture entirely (→ PR #492).
+Notes: [miningjobmap-notes.md](../research/stratum/miningjobmap-notes.md)
 
 ## PRs Reviewed
 
