@@ -389,3 +389,153 @@ generic error. Tracked for the share accounting PR (planned Month 2).
 The original `~2KB per entry` estimate was wrong — `BlockTemplate` contains
 `Vec<Transaction>` which is much larger. PR description corrected. Actual size
 is 100KB–500KB per entry depending on mempool fullness.
+
+---
+
+## Why PR #484 Was Closed — mcelrath's Review Finding
+
+mcelrath identified a correctness bug in the eviction logic: eviction deleted
+by `template_id`, not by `job_id`. The resend path (when a new miner connects
+and gets the current template) inserts the same `template_id` a second time
+under a new `job_id`. When the older `job_id` is evicted, the code did:
+
+```rust
+self.mining_jobs.remove(&old_template);  // deletes by template_id
+```
+
+This silently deleted the template entry, making the newer `job_id` (still
+pointing at that `template_id`) return `MiningJobNotFound` on submit — a valid
+share rejected.
+
+This couldn't be fixed cleanly within the per-miner architecture. The correct
+fix required rethinking the storage structure entirely, which led to PR #492.
+
+---
+
+## New Approach — `GlobalJobStore` (PR #492)
+
+### Core idea
+
+Replace all per-miner `MiningJobMap`s with a single `GlobalJobStore` shared
+across every connection. `JobDetails` is wrapped in `Arc` so all miners point
+at one allocation. The notify loop inserts once and fans out pointer copies —
+zero template clones.
+
+```rust
+pub struct GlobalJobStore {
+    jobs: HashMap<TemplateId, Arc<JobDetails>>,
+    job_id_to_template: HashMap<u64, TemplateId>,
+    next_job_id: u64,
+    capacity: usize,
+}
+```
+
+### How each problem from PR #484 is solved
+
+**Memory (5 GB → 500 KB at 10k miners)**
+
+Old notify loop:
+```rust
+for (peer, map) in job_map_arc.iter() {
+    let template_for_job = template.clone(); // 500 KB × 10k = 5 GB
+    map.insert_mining_job(template_id, job_details).await;
+}
+```
+
+New notify loop:
+```rust
+let job_details = Arc::new(JobDetails { ... }); // one allocation
+let job_id = global_job_store.lock().await.insert(template_id, Arc::clone(&job_details));
+for sender in &downstream_senders {
+    sender.send(job_id).await;  // pointer copy, no clone
+}
+```
+
+**Correctness bug (mcelrath's finding)**
+
+Eviction now removes by `job_id` slot, only freeing the template when no other
+`job_id` still references it:
+
+```rust
+if let Some(old_template_id) = self.job_id_to_template.remove(&oldest_id) {
+    let still_referenced = self.job_id_to_template.values().any(|&tid| tid == old_template_id);
+    if !still_referenced {
+        self.jobs.remove(&old_template_id);
+    }
+}
+```
+
+Two `job_id`s sharing a `template_id` (resend path) no longer clobber each
+other on eviction.
+
+**`entry().or_insert()` — no duplicate Arc on resend**
+
+When a new miner triggers a resend of the current template, `insert()` uses
+`entry().or_insert_with()` to return the existing `Arc` without a second
+allocation:
+
+```rust
+let arc = self.jobs
+    .entry(template_id)
+    .or_insert_with(|| Arc::new(job))
+    .clone();
+```
+
+**Churn eviction bug — `latest_job_id_for()`**
+
+With capacity=5, six rapid reconnects would mint new `job_id`s and evict the
+one that already-connected miners are submitting against. The resend path now
+calls `latest_job_id_for(template_id)` to reuse the existing `job_id` rather
+than minting a new one:
+
+```rust
+pub fn latest_job_id_for(&self, template_id: TemplateId) -> Option<u64> {
+    self.job_id_to_template
+        .iter()
+        .filter(|(_, &tid)| tid == template_id)
+        .map(|(&id, _)| id)
+        .max()
+}
+```
+
+A new `job_id` is only minted when a brand-new template arrives via the notify
+loop, or in the cold path where the resend fires before any miner has ever
+connected (so no existing `job_id` exists yet).
+
+**Combined `get()` — single lookup instead of double**
+
+Old submit path did two separate map traversals:
+```rust
+let template_id = map.template_id_from_job_id(job_id)?;  // traversal 1
+let job = map.get_by_job_id(job_id)?;                    // traversal 2
+```
+
+New `get()` returns both in one shot:
+```rust
+pub fn get(&self, job_id: u64) -> Result<(Arc<JobDetails>, TemplateId), StratumErrors> {
+    let &template_id = self.job_id_to_template.get(&job_id)
+        .ok_or(StratumErrors::MiningJobNotFound { ... })?;
+    let job = self.jobs.get(&template_id)
+        .ok_or(StratumErrors::MiningJobNotFound { ... })?;
+    Ok((Arc::clone(job), template_id))
+}
+```
+
+### Capacity change: 10 → 5
+
+The old `MAX_JOBS_PER_MINER = 10` was per-miner. The new
+`GLOBAL_JOB_STORE_CAPACITY = 5` is global. Because `next_job_id` is now the
+only source for new `job_id`s (resend reuses existing ones), 5 slots covers
+~750 ms of bead-rate templates — enough for in-flight shares from any connected
+miner with reasonable latency.
+
+### Unit tests added (6)
+
+| Test | What it checks |
+|---|---|
+| `eviction_at_capacity` | oldest slot removed when full |
+| `still_referenced_template_survives_eviction` | template not freed while another job_id points to it |
+| `arc_reuse_on_duplicate_template_id` | `entry().or_insert()` returns same Arc |
+| `evicted_id_returns_not_found` | `get()` errors on evicted id |
+| `latest_job_id_for_returns_max_id` | returns highest job_id for a template |
+| `latest_job_id_for_absent_after_eviction` | returns None once all job_ids for template are evicted |

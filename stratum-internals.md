@@ -338,7 +338,9 @@ During `handle_submit`, if a mask was negotiated, the miner must pass
 
 ---
 
-## 9. MiningJobMap — Job Storage and Eviction
+## 9. Job Storage and Eviction
+
+### Current Design — per-miner `MiningJobMap` (on `dev`)
 
 Each downstream miner connection has its own `MiningJobMap` keyed by
 `peer_addr` in a shared `HashMap<String, Arc<Mutex<MiningJobMap>>>`.
@@ -352,30 +354,93 @@ pub struct MiningJobMap {
 }
 ```
 
-### Eviction (insert_mining_job)
-
-`MAX_JOBS_PER_MINER = 10` (lib.rs). On every insert, if the map is full, the
-oldest job is evicted:
+The notify loop clones the full template once per miner:
 
 ```rust
-if self.job_id_to_template.len() >= self.capacity {
-    // oldest_id = next_job_id - capacity (exact, because ids are sequential)
-    if let Some(oldest_id) = numeric_job_id.checked_sub(self.capacity as u64) {
-        if let Some(old_template) = self.job_id_to_template.remove(&oldest_id) {
-            self.mining_jobs.remove(&old_template);
-        }
+for (peer, map) in job_map_arc.iter() {
+    let template_for_job = template.clone(); // ~100–500 KB per miner
+    map.insert_mining_job(template_id, job_details).await;
+}
+```
+
+**Eviction**: `MAX_JOBS_PER_MINER = 10` (lib.rs). On every insert, if the map
+is full, the oldest job is removed. Because `next_job_id` is monotonically
+increasing, the oldest surviving ID is always `next_job_id - capacity` — O(1),
+no timestamp needed.
+
+**Known bug** (found in PR #484 review by mcelrath): eviction removes by
+`template_id`. If two `job_id`s share the same `template_id` (happens via the
+reconnect resend path), evicting the older one deletes the template entry and
+the newer `job_id` returns `MiningJobNotFound` on submit.
+
+**Scale problem**: at 10,000 miners × 500 KB template, the notify loop
+allocates ~5 GB per new bead. At 150 ms bead rates the node OOM-crashes within
+hours.
+
+---
+
+### New Design — `GlobalJobStore` (PR #492, open)
+
+One `GlobalJobStore` is constructed in `main.rs` and shared across all
+connections via `Arc<Mutex<GlobalJobStore>>`. Per-miner maps are removed
+entirely.
+
+```rust
+pub struct GlobalJobStore {
+    jobs: HashMap<TemplateId, Arc<JobDetails>>,    // one Arc shared by all miners
+    job_id_to_template: HashMap<u64, TemplateId>, // numeric id → template_id
+    next_job_id: u64,
+    capacity: usize,
+}
+```
+
+`JobDetails` is `Arc`-wrapped. The notify loop builds the job once, inserts
+once, and sends N pointer copies — zero template clones:
+
+```rust
+// Build and insert once
+let job_details = Arc::new(JobDetails { ... });
+let job_id = global_job_store.lock().await.insert(template_id, Arc::clone(&job_details));
+
+// Fan out to all miners — pointer copy only
+for sender in &downstream_senders {
+    sender.send(job_id).await;
+}
+```
+
+**`insert()`** uses `entry().or_insert()` — if the same `template_id` arrives
+again (resend path), the existing `Arc` is returned without a new allocation.
+
+**Eviction** (`GLOBAL_JOB_STORE_CAPACITY = 5`, ~750 ms retention at bead
+rate): oldest `job_id` slot is removed. Template data is only freed when **no
+remaining `job_id` references it** — fixes the mcelrath bug from #484:
+
+```rust
+if let Some(old_template_id) = self.job_id_to_template.remove(&oldest_id) {
+    let still_referenced = self.job_id_to_template.values().any(|&tid| tid == old_template_id);
+    if !still_referenced {
+        self.jobs.remove(&old_template_id);
     }
 }
 ```
 
-O(1) eviction per insert. No heap allocation. No timestamp needed.
+**`latest_job_id_for(template_id)`** — on miner reconnect, reuses the existing
+`job_id` for the current template instead of minting a new one. Without this,
+rapid reconnects at capacity=5 advance `next_job_id` and eventually evict the
+`job_id` that connected miners are actively submitting against.
 
-### Why 10?
+**`get(job_id)`** returns `(Arc<JobDetails>, TemplateId)` in a single map
+traversal, replacing the previous double lookup.
 
-A miner submitting a share for a job older than the last 10 templates is
-working on stale data anyway — the block has almost certainly already been
-found. 10 is conservative; it covers several minutes of templates at typical
-block arrival rates.
+**Memory comparison**:
+
+| | Per-miner `MiningJobMap` | `GlobalJobStore` |
+|---|---|---|
+| Template allocations per bead | 1 per miner (N total) | 1 total |
+| 10k miners × 500 KB template | ~5 GB | ~500 KB |
+| Map instances | 10k | 1 |
+| Capacity | 10 per miner | 5 global |
+| Retention at 150 ms bead rate | ~1.5 s | ~750 ms |
 
 ---
 
