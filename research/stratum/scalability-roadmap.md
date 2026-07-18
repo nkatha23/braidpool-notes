@@ -119,7 +119,7 @@ holds this data so no new system dependency is needed.
 
 Memory: `~500KB → ~5KB`.
 
-**Why not do Phase 2 now:**
+**Why Phase 2 now:**
 Phase 2 changes the hot path of `handle_submit` (every share submission) and
 requires validating the fallback when a template has been evicted from cache
 before the full block is found. That's a separate, careful change. Phase 1 gives
