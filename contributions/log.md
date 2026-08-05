@@ -23,6 +23,24 @@ Reviewed by Zaid (Code ACK c4e89d2), merged by Zaid into dev.
 
 ## Open PRs
 
+### [PR #503](https://github.com/braidpool/braidpool/pull/503) — feat(stratum): add per-miner share counters (accepted/stale/invalid)
+`ShareCounters { accepted, stale, invalid }` struct on `DownstreamClient`.
+Counters bumped at every exit point of `handle_submit`: `invalid` at auth gate,
+malformed params, job-not-found (stale), PoW failure; `accepted` after all
+miner-input validation passes (before `propagate_valid_bead`); `stale` at job
+eviction sites. Logged on miner disconnect. Five unit tests cover each counter
+path independently (unauthorized submit uses valid-looking params so the only
+failure path is the auth gate). Rebased on dev post-#509 merge; resolved 6
+merge conflicts.
+
+### [PR #508](https://github.com/braidpool/braidpool/pull/508) — fix(tests): eliminate shared SQLite state causing parallel test races
+Added `DBHandler::new_in_memory()` — an in-memory constructor for tests with
+`max_connections(1)` (required: `sqlite::memory:` gives each connection its own
+private DB) and `Executor::execute(SCHEMA)` (handles multi-statement SQL).
+Updated `test_batch_insertion_beads` to use it directly. Applied Sansh DRY
+feedback (removed `test_db_initializer()` helper). Applied Copilot feedback
+(`max_connections(1)` and `db_connection_pool.execute(SCHEMA)`).
+
 ### [PR #492](https://github.com/braidpool/braidpool/pull/492) — refactor(stratum): replace per-miner MiningJobMap with GlobalJobStore
 Replaces all per-miner `MiningJobMap`s with a single `GlobalJobStore` shared
 across all connections via `Arc<Mutex<GlobalJobStore>>`. `JobDetails` is
@@ -51,9 +69,11 @@ Notes: [miningjobmap-notes.md](../research/stratum/miningjobmap-notes.md)
 
 ## Planned Work
 
-| Priority | Item | Roadmap ref |
-|----------|------|-------------|
-| Month 1 | `MiningJobMap` capacity cap | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-1) |
-| Month 2 | `ConnectionGuard` drop pattern | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-2) |
-| Month 3 | `DashMap` migration | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-3) |
-| Follow-up | Refactor `or_insert_with` in `fetch_beads_in_batch` | follow-up to #475 |
+| Priority | Item | Blocker | Notes |
+|----------|------|---------|-------|
+| Next | `getminer` RPC (#298) | #503 and #492 merge | Needs `ShareCounters` (Braidpool path) + `AuditDAG.get_stats` (audit path) |
+| Next | #492 rebase | Wait for #509 merge | `refactor/stratum-global-template-store` has conflicts with dev |
+| Month 1 | `MiningJobMap` capacity cap | — | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-1) |
+| Month 2 | `ConnectionGuard` drop pattern | — | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-2) |
+| Month 3 | `DashMap` migration | — | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-3) |
+| Follow-up | Refactor `or_insert_with` in `fetch_beads_in_batch` | — | follow-up to #475 |

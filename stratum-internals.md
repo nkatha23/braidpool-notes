@@ -1,7 +1,8 @@
 # Braidpool Stratum Layer — Deep Internals
 
 > All code references point to `node/src/` in the braidpool repo.
-> Line numbers reflect the `dev` branch as of 2026-07-03.
+> Line numbers reflect the `dev` branch as of 2026-08-05.
+> See also: `research/stratum/audit-mode.md` for the full audit mode architecture.
 
 ---
 
@@ -217,7 +218,7 @@ merkle path using double-SHA256, producing the final merkle root for the header.
 
 ## 6. mining.submit — Full Validation Sequence
 
-`handle_submit()` signature (stratum.rs ~line 382):
+`handle_submit()` signature (stratum.rs):
 
 ```rust
 pub async fn handle_submit(
@@ -226,64 +227,50 @@ pub async fn handle_submit(
     mining_job_map: Arc<Mutex<MiningJobMap>>,
     client_request_id: u64,
     swarm_handler: Arc<Mutex<SwarmHandler>>,
+    audit_dag: Option<Arc<Mutex<AuditDAG>>>,          // audit mode
+    upstream_share_tx: Option<mpsc::Sender<UpstreamShare>>, // audit mode
+    upstream_difficulty: Option<f64>,                  // audit mode
 ) -> Result<StratumResponses, StratumErrors>
 ```
 
-**Step-by-step:**
+**Step-by-step (Braidpool normal path):**
 
-1. **Parse params** — extract worker_name, job_id (u64), extranonce2 (hex),
-   ntime (hex u32), nonce (hex u32). Returns error if any field is missing or
-   wrong type.
+1. **Authorization gate** — if `!self.authorized`, bump `share_counters.invalid`
+   and return error immediately. No params are parsed.
 
-2. **Look up job** — `mining_job_map.get_by_job_id(numeric_job_id)` returns
-   the `JobDetails` (which contains the `BlockTemplate`, coinbase1/2, merkle
-   path). Returns `MiningJobNotFound` if the job has been evicted.
+2. **Parse params** — extract worker_name, job_id string, extranonce2 (hex),
+   ntime (hex u32), nonce (hex u32).
 
-3. **Reconstruct coinbase** — as described above.
+3. **Look up job** — job_id is first tried via `get_by_string_job_id()` (audit
+   mode), then parsed as decimal u64, then hex u64, then `get_by_job_id()`.
+   Returns `JobIdCouldNotBeParsed` (invalid++) or `MiningJobNotFound` (stale++).
 
-4. **Compute merkle root** — as described above.
+4. **Route on `is_upstream_job`** — if `TemplateId::Upstream`, early-return to
+   `validate_and_forward_upstream_share()`. See `research/stratum/audit-mode.md`.
 
-5. **Apply version rolling** (if miner negotiated BIP310):
+5. **Reconstruct coinbase** — `coinbase1 + extranonce1 + extranonce2 + coinbase2`.
+
+6. **Parse extranonce2** — hex decode to `u64`. On failure: `invalid++`, return.
+
+7. **Compute merkle root** — as described in Section 5.
+
+8. **Apply version rolling** (if miner negotiated BIP310):
    ```rust
-   let mask = self.version_rolling_mask;  // stored from handle_configure
-   // Validate: miner must not set bits outside the negotiated mask
+   let mask = self.version_rolling_mask;
    let precondition = version_bits & !mask_version_bits;
-   if precondition != 0 {
-       return Err(StratumErrors::MaskNotValid{...});
-   }
-   // Apply: keep non-rollable bits from template, take rollable bits from miner
+   if precondition != 0 { return Err(StratumErrors::MaskNotValid{...}); }
    final_version = (header_version & !mask) | (version_bits & mask);
    ```
 
-6. **Build block header**:
-   ```rust
-   let header = BlockHeader {
-       version: BlockVersion::from_consensus(final_masked_version),
-       prev_blockhash: submitted_job.blocktemplate.previousblockhash,
-       merkle_root,
-       time: BlockTime::from_u32(ntime_u32),
-       bits: submitted_job.blocktemplate.bits,
-       nonce: nonce_u32,
-   };
-   ```
+9. **Build block header** and **validate PoW** against `bits` target.
+   - On PoW failure: `invalid++`, return `json!(false)`.
 
-7. **Validate PoW**:
-   ```rust
-   match header.validate_pow(target) {
-       Ok(_) => {
-           // Send to block submission channel (to Bitcoin Core via IPC)
-           submission_tx.send(BlockSubmissionRequest { template_id, header, coinbase_transaction })?;
-           // Return true to miner
-           StandardResponse::new_ok(Some(client_request_id), json!(true))
-       }
-       Err(_) => {
-           // Return false — invalid share, not an error
-           StandardResponse::new_ok(Some(client_request_id), json!(false))
-       }
-   }
-   ```
+10. **All validation passed** — `accepted++` bumped here (after all miner-input
+    checks, before node-side operations).
 
-   The `target` is derived from the template's `bits` field (compact target).
+11. **Propagate bead** to libp2p via `SwarmHandler::propagate_valid_bead()`.
+
+12. If PoW meets full Bitcoin target: also submit to Bitcoin Core via IPC.
 
 ---
 
@@ -345,6 +332,14 @@ During `handle_submit`, if a mask was negotiated, the miner must pass
 Each downstream miner connection has its own `MiningJobMap` keyed by
 `peer_addr` in a shared `HashMap<String, Arc<Mutex<MiningJobMap>>>`.
 
+`TemplateId` is an enum (defined in `lib.rs`):
+```rust
+pub enum TemplateId {
+    Braidpool(u64),    // template from Bitcoin Core via IPC (normal mode)
+    Upstream(String),  // job ID string from upstream pool (audit mode)
+}
+```
+
 ```rust
 pub struct MiningJobMap {
     mining_jobs: HashMap<TemplateId, JobDetails>,     // template_id → full job
@@ -353,6 +348,13 @@ pub struct MiningJobMap {
     capacity: usize,                                   // eviction cap
 }
 ```
+
+`JobDetails` gained `is_upstream_job: bool` — set `true` for `TemplateId::Upstream`
+jobs so `handle_submit` can route to the audit path without inspecting the enum.
+
+Audit mode jobs are also reachable via `get_by_string_job_id()` — a second index
+that maps the upstream's raw string job_id to the internal numeric slot. This
+avoids parse failures on non-numeric upstream job IDs.
 
 The notify loop clones the full template once per miner:
 
@@ -569,31 +571,63 @@ const MAX_LINE_LENGTH: usize = 65536;          // max bytes per JSON message fro
 
 ## 14. Data Flow Summary
 
+### Normal mode (Braidpool path)
+
 ```
 Bitcoin Core
     │  (IPC socket / getblocktemplate)
     ▼
 ipc_template_consumer
-    │  (NotifyCmd channel)
+    │  (NotifyCmd channel — TemplateId::Braidpool)
     ▼
 stratum::Notifier  ──────────────────────────────────► mining.notify → miner TCP
     │                                                       │
-    │                                               miner rolls nonce space:
-    │                                               extranonce2 (8 bytes) × nonce (4 bytes)
-    │                                               × version_bits (BIP310, up to 13 bits)
-    │                                                       │
+    │                                               miner rolls nonce space
     │                                               mining.submit
     ▼                                                       │
 stratum::handle_submit ◄────────────────────────────────────┘
-    │  reconstruct coinbase
-    │  compute merkle root
-    │  build BlockHeader
-    │  validate_pow(target)
+    │  auth gate → reconstruct coinbase → compute merkle root
+    │  build BlockHeader → validate_pow(target)
+    │  accepted++ (after all validation)
     │
     ├── if PoW meets full Bitcoin target ──► block_submission_tx ──► Bitcoin Core (IPC)
     │
     └── if PoW meets pool weak target ──► propagate_valid_bead()
             │  build Bead (committed + uncommitted metadata)
-            │  braid.extend(&bead)   ← DAG update
+            │  braid.extend(&bead)   ← consensus DAG update
             └── SwarmCommand::PropagateValidBead ──► libp2p floodsub ──► peers
 ```
+
+### Audit mode (proxy path)
+
+```
+Upstream Pool (Ocean / etc.)
+    │  (TCP / Stratum V1)
+    ▼
+UpstreamPoolClient
+    │  subscribe → extranonce1 (4 bytes), extranonce2_size
+    │  authorize → confirmed
+    │  repackage jobs: inject commitment into ext1 slots [4:11]
+    │  (TemplateId::Upstream)
+    ▼
+stratum::Notifier ─────────────────────────────────► mining.notify → miner TCP
+                                                              │
+                                                      mining.submit
+                                                              ▼
+                                               stratum::handle_submit
+                                                 (is_upstream_job = true)
+                                                              │
+                                              validate_and_forward_upstream_share
+                                                     ┌────────┴────────┐
+                                                     ▼                 ▼
+                                             AuditDAG              upstream_share_tx
+                                             .add_and_record_bead   │
+                                             (audit.db)             ▼
+                                                           UpstreamPoolClient
+                                                           forward mining.submit
+                                                                     │
+                                                           upstream response
+                                                           → AuditRecord updated
+```
+
+For full audit mode detail see `research/stratum/audit-mode.md`.
