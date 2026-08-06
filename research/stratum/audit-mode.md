@@ -462,5 +462,5 @@ stratum::Notifier ────────────────────�
 | Task | Status | Blocker |
 |------|--------|---------|
 | `getminer` RPC (#298) | Unimplemented | Needs `MinerStatsView` + `AuditDAG.get_stats` wired to RPC handler |
-| PR #492 rebase | Blocked | Wait for PR #509 merge; `refactor/stratum-global-template-store` conflicts with dev |
+| PR #492 rebase | Needs rebase | #509 merged into dev — branch now conflicts with audit mode changes |
 | MinerStatsView error rate | Design gap | Invalid/stale counts live in memory only; need schema change or in-memory join to expose via RPC |

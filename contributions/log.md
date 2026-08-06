@@ -72,7 +72,7 @@ Notes: [miningjobmap-notes.md](../research/stratum/miningjobmap-notes.md)
 | Priority | Item | Blocker | Notes |
 |----------|------|---------|-------|
 | Next | `getminer` RPC (#298) | #503 and #492 merge | Needs `ShareCounters` (Braidpool path) + `AuditDAG.get_stats` (audit path) |
-| Next | #492 rebase | Wait for #509 merge | `refactor/stratum-global-template-store` has conflicts with dev |
+| Next | #492 rebase | — | #509 merged; needs rebase onto dev (audit mode added `TemplateId`, `is_upstream_job`, new `handle_submit` params) |
 | Month 1 | `MiningJobMap` capacity cap | — | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-1) |
 | Month 2 | `ConnectionGuard` drop pattern | — | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-2) |
 | Month 3 | `DashMap` migration | — | [scalability-roadmap.md](../research/stratum/scalability-roadmap.md#month-3) |
