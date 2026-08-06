@@ -21,15 +21,15 @@ It proves the miner did real SHA256 work. Contains:
 
 ## DAG / Braid Structure
 
-Multiple beads can arrive simultaneously — no single chain.
+Multiple beads can arrive simultaneously: no single chain.
 Each bead references its parents (other beads it has seen).
 The full structure is a Directed Acyclic Graph (DAG).
 
 **No-incest rule:** a bead cannot name an ancestor-of-a-parent as a direct parent.
-This eliminates triangles in the graph — there's no new information in naming a
+This eliminates triangles in the graph, there's no new information in naming a
 higher-order ancestor since it's already implied by the parent reference.
 
-A **cohort** is a group of beads between two graph cuts — all beads
+A **cohort** is a group of beads between two graph cuts, all beads
 that happened between two points of global consensus.
 
 ```

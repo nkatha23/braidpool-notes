@@ -8,12 +8,12 @@ Paper: [PAPER.md](https://github.com/zaidmstrr/braidpool-edca-research/blob/main
 Exponentially Decayed Cohort Average. The payout algorithm Braidpool
 will use instead of PPLNS.
 
-Traditional pools use PPLNS (Pay Per Last N Shares) — a sliding window
+Traditional pools use PPLNS (Pay Per Last N Shares): a sliding window
 over the last N shares submitted. PPLNS was designed for linear chains
 where shares are ordered sequentially. It creates incentives for pool
 hopping (miners leave before a block is found, rejoin after).
 
-Braidpool uses a DAG — shares arrive concurrently in cohorts. PPLNS
+Braidpool uses a DAG, shares arrive concurrently in cohorts. PPLNS
 doesn't map cleanly to a DAG because there's no single linear ordering
 of shares within a cohort.
 
@@ -22,7 +22,7 @@ of shares within a cohort.
 Instead of a sliding window over N shares, EDCA uses an exponential
 decay function applied per cohort. Older cohorts contribute less to
 the payout calculation. The decay is deterministic from the DAG
-structure — every node computes the same result independently.
+structure, every node computes the same result independently.
 
 ## Formal Equations
 
@@ -166,7 +166,7 @@ size (PR #475) — each share must be attributable to exactly one miner.
 My stratum work is a prerequisite for correct EDCA payouts.
 
 The Fee Amplifier (B1 in analysis doc) also requires stratum to pass
-`F_i` from the block template into committed metadata — a future stratum task.
+`F_i` from the block template into committed metadata, a future stratum task.
 
 See: [stratum protocol requirements analysis](../stratum/protocol-requirements-analysis.md)
 
