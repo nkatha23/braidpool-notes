@@ -1,11 +1,7 @@
 # Braidpool Notes
 
-Research notes, contribution logs, and learning resources from my work
-on Braidpool — a decentralized Bitcoin mining pool.
-
-## About
-
-I'm a software developer and Bitcoin OSS contributor working on Braidpool. These notes document my research, the problems I'm
+Learning resources from my work on [Braidpool](https://github.com/braidpool/braidpool), a decentralized Bitcoin mining pool.
+These notes document my research, the problems I'm
 investigating, and my understanding of the protocol as it develops.
 
 
