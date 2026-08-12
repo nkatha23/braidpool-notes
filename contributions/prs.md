@@ -21,9 +21,6 @@ Replaced both RNG calls with a single monotonically increasing `AtomicU32` count
 #### Design note
 `Ordering::SeqCst` on the counter could be relaxed to `Ordering::Relaxed` in a follow-up — the counter only needs to produce unique values, not coordinate memory visibility with anything else.
 
-#### Review
-- **mcelrath** (Code ACK): "Good catch, and good solution."
-
 ---
 
 ### [#475](https://github.com/braidpool/braidpool/pull/475) — feat: extend extranonce1 and extranonce2 to 8 bytes each
@@ -54,9 +51,6 @@ Added an optional oneshot channel parameter to `run_stratum_service`. After bind
 
 This pattern was already in use in `rpc_server.rs` via `server.local_addr()`, so the approach is consistent with the rest of the codebase. Production call in `main.rs` passes `None`, zero impact outside tests.
 
-#### Review
-- **zaidmstrr** (Concept ACK → Code ACK): "The problem seems to exist." Suggested a follow-up refactor to move `TcpListener::bind` to the caller entirely — this became #479.
-
 ---
 
 ### [#479](https://github.com/braidpool/braidpool/pull/479) — refactor(stratum): move TcpListener binding to caller
@@ -70,10 +64,6 @@ Moved binding entirely to the caller. `run_stratum_service` now accepts a ready 
 
 Tests now bind their own listener before spawning, read the port directly from `local_addr()` — no channel, no sleep, no race window. Removes the `port` field from `StratumServerConfig` (no longer used inside the server). Consistent with `rpc_server.rs` which already followed this pattern. Removes the oneshot channel from #477.
 
-#### Review
-- **Sansh2356** (t-ACK): Suggested also removing `port` from `StratumConfig` — implemented.
-- **zaidmstrr** (Approach ACK → Code ACK): Left nits on logging and config cleanup; all resolved before merge.
-
 ---
 
 ### [#482](https://github.com/braidpool/braidpool/pull/482) — fix(tests): replace hardcoded RPC server ports with OS-assigned port 0
@@ -84,11 +74,6 @@ RPC server tests were binding to hardcoded ports (9001–9101, 8889, 9000, and o
 
 #### Approach
 Same fix as #477, applied to the RPC layer. All 16 `run_rpc_server` tests switch to `"127.0.0.1:0"` and capture the returned `SocketAddr`. All 4 `Server::builder()` tests call `server.local_addr()` after build. Removed 6 blind sleep calls.
-
-#### Review
-- **Sansh2356** (t-ACK)
-- **mcelrath** (Approved)
-- **copilot**: Automated review confirming the approach.
 
 ---
 
@@ -101,9 +86,6 @@ Same fix as #477, applied to the RPC layer. All 16 `run_rpc_server` tests switch
 #### Approach
 Added assertions on both the wire response (`result["version-rolling.mask"] == "1fffe000"`) and `self.version_rolling_mask` — the stored state that `handle_submit` actually validates rolled version bits against. Two assertions, one for the protocol response and one for the internal state that drives subsequent validation.
 
-#### Review
-- **Sansh2356** (Code ACK): "Nice nit and tested."
-- **zaidmstrr** (Approved): "Tested and looks good. Thanks for spotting this out."
 
 ---
 
@@ -112,7 +94,7 @@ Added assertions on both the wire response (`result["version-rolling.mask"] == "
 ---
 
 ### [#492](https://github.com/braidpool/braidpool/pull/492) — refactor(stratum): replace per-miner MiningJobMap with GlobalJobStore
-**Status:** Draft (awaiting rebase after #509 merge) | **Supersedes:** #484
+**Status:** Draft | **Supersedes:** #484
 
 #### Problem
 Every miner connection had its own `MiningJobMap`. The notify loop cloned the full block template (~100–500 KB) once per miner on each new bead:
@@ -148,10 +130,6 @@ Memory result: ~5 GB → ~500 KB at 10k connections.
 - `latest_job_id_for` signature changed to `&TemplateId` (non-Copy-safe)
 - All second-commit tests updated for the new API (`TemplateId::Braidpool(n)` instead of raw integers)
 
-#### Review
-- **zaidmstrr** (Approach ACK): "Great refactor and optimization. Dependent on #509 — rebase required after that merges."
-- **copilot**: Automated review on three changed files.
-
 ---
 
 ### [#503](https://github.com/braidpool/braidpool/pull/503) — feat(stratum): add per-miner share counters (accepted/stale/invalid)
@@ -173,9 +151,6 @@ Counters logged at disconnect. Five unit tests cover each counter path independe
 
 **Post-#509 rebase note**: Audit-mode submissions return early via `validate_and_forward_upstream_share` before any counter, so these counters cover the Braidpool submit path only. Audit mode has its own accounting via `AuditDAG` and `MinerStatsView`, though that view tracks valid beads only and doesn't expose an error rate. The authorization gate now sits upstream of every bump, so an unauthorized `mining.submit` is counted nowhere — left that way deliberately (protocol-state violation, not a share-quality signal).
 
-#### Review
-- **copilot**: Automated review.
-
 ---
 
 ### [#508](https://github.com/braidpool/braidpool/pull/508) — fix(tests): eliminate shared SQLite state causing parallel test races
@@ -189,10 +164,6 @@ Three changes:
 1. **`schema.sql`**: Added `IF NOT EXISTS` on all `CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`. Eliminates the already-exists race for any file-based test.
 2. **`DBHandler::new_in_memory()`**: New `#[cfg(test)]` constructor using `sqlite::memory:`. Critical subtlety: `sqlite::memory:` gives each connection its own private database — requires `max_connections(1)` so all queries share one connection and therefore one schema. Schema embedded via `include_str!`, no file path dependency.
 3. **`stratum.rs`**: All six `DBHandler::new()` call sites in tests switched to `new_in_memory()`. Each test gets a private isolated database.
-
-#### Review
-- **Sansh2356**: DRY feedback — removed `test_db_initializer()` helper.
-- **copilot**: Suggested `max_connections(1)` and `db_connection_pool.execute(SCHEMA)`, both applied.
 
 ---
 
