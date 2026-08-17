@@ -30,6 +30,15 @@ error ordering) and `unpadded_nonce_not_rejected_by_length_check` (pins the
 no-strict-width-check policy). Tests use `MiningJobMap` — no dependency on
 #492. Merged by zaidmstrr.
 
+### [PR #508](https://github.com/braidpool/braidpool/pull/508) — fix(tests): eliminate shared SQLite state causing parallel test races
+Added `DBHandler::new_in_memory()` — in-memory constructor for tests with
+`max_connections(1)` and schema embedded via `include_str!`. Removed
+`test_db_initializer()` helper (DRY feedback from Sansh). Updated
+`test_batch_insertion_beads` to use `new_in_memory()` directly. Added
+`IF NOT EXISTS` to all `CREATE TABLE/INDEX/VIEW` in `schema.sql`. Switched
+all six stratum test callsites from `DBHandler::new()` to `new_in_memory()`.
+Fixes #504. Merged by zaidmstrr.
+
 ## Open PRs
 
 ### [PR #503](https://github.com/braidpool/braidpool/pull/503) — feat(stratum): add per-miner share counters (accepted/stale/invalid)
@@ -42,13 +51,6 @@ path independently (unauthorized submit uses valid-looking params so the only
 failure path is the auth gate). Rebased on dev post-#509 merge; resolved 6
 merge conflicts.
 
-### [PR #508](https://github.com/braidpool/braidpool/pull/508) — fix(tests): eliminate shared SQLite state causing parallel test races
-Added `DBHandler::new_in_memory()` — an in-memory constructor for tests with
-`max_connections(1)` (required: `sqlite::memory:` gives each connection its own
-private DB) and `Executor::execute(SCHEMA)` (handles multi-statement SQL).
-Updated `test_batch_insertion_beads` to use it directly. Applied Sansh DRY
-feedback (removed `test_db_initializer()` helper). Applied Copilot feedback
-(`max_connections(1)` and `db_connection_pool.execute(SCHEMA)`).
 
 ### [PR #492](https://github.com/braidpool/braidpool/pull/492) — refactor(stratum): replace per-miner MiningJobMap with GlobalJobStore
 Replaces all per-miner `MiningJobMap`s with a single `GlobalJobStore` shared
@@ -72,9 +74,11 @@ Notes: [miningjobmap-notes.md](../research/stratum/miningjobmap-notes.md)
 
 ## PRs Reviewed
 
-- [**#466**](https://github.com/braidpool/braidpool/pull/466) — WebSocket push notifications (ACK)
+- [**#398**](https://github.com/braidpool/braidpool/pull/398) — De-fork rust-bitcoin / CPUNet extension crate 
+(pass; open blockers: RPC hash inconsistency, DB migration, bitcoinproxy auth gap)
+- [**#466**](https://github.com/braidpool/braidpool/pull/466) — WebSocket push notifications 
 - [**#473**](https://github.com/braidpool/braidpool/pull/473) — Docker setup (tested locally, found health check issue)
-- [**#474**](https://github.com/braidpool/braidpool/pull/474) — `extend()` returns adopted orphan beads (ACK, tested locally)
+- [**#474**](https://github.com/braidpool/braidpool/pull/474) — `extend()` returns adopted orphan beads (tested locally)
 
 ## Planned Work
 
