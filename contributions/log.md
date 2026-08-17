@@ -21,6 +21,15 @@ server). Removes oneshot channel from PR #477 — tests call `local_addr()`
 directly before spawning. Consistent with `rpc_server.rs` pattern.
 Reviewed by Zaid (Code ACK c4e89d2), merged by Zaid into dev.
 
+### [PR #525](https://github.com/braidpool/braidpool/pull/525) — fix(stratum): parse ntime and nonce before coinbase reconstruction
+Moved both `u32::from_str_radix` blocks to immediately after the audit-mode
+early return, before job lookup and coinbase work. Fixed extranonce2 error
+message field (`extranonce2_len` → `miner_extranonce2_size`). Two tests:
+`non_hex_ntime_returns_err_before_coinbase_work` (distinguishes old vs new
+error ordering) and `unpadded_nonce_not_rejected_by_length_check` (pins the
+no-strict-width-check policy). Tests use `MiningJobMap` — no dependency on
+#492. Merged by zaidmstrr.
+
 ## Open PRs
 
 ### [PR #503](https://github.com/braidpool/braidpool/pull/503) — feat(stratum): add per-miner share counters (accepted/stale/invalid)

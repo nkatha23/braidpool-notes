@@ -1,7 +1,7 @@
 # MiningJobMap — Working Notes
 
 PR: [#484](https://github.com/braidpool/braidpool/pull/484)  
-Files changed: `node/src/lib.rs` (+5), `node/src/stratum.rs` (+54 / -9)
+Files changed: `node/src/lib.rs` , `node/src/stratum.rs` 
 
 ---
 
