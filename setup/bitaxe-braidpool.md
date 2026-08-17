@@ -1,6 +1,8 @@
 # Bitaxe + Braidpool Setup
 
-**Hardware in hand:** Bitaxe (BM1370 ASIC, Noctua fan upgrade, OSMU board visible in photos)
+**Hardware in hand:** Bitaxe (BM1370 ASIC, Noctua fan upgrade, OSMU board visible in photo)
+
+![Bitaxe](image.png)
 **Status:** Planning; setup session scheduled this week
 
 ---
