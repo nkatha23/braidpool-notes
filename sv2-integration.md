@@ -1,7 +1,5 @@
 # Braidpool SV2 Integration — Implementation Document
 
-*Audited against `dev` branch (360f7b8). All ten audit findings incorporated.*
-
 ---
 
 ## 1. The Problem
@@ -28,16 +26,16 @@ initial data gathering but has three production-scale problems:
 **We use SV2 for:**
 
 - Noise protocol encrypted channel between pool and translator proxy (NX-handshake, NoiseTcpStream)
-  — the pool authenticates with a static keypair, preventing job injection
+, the pool authenticates with a static keypair, preventing job injection
 - Extended Channel for pool↔tproxy job distribution — one channel carries all miners' work,
   tproxy subdivides the extranonce space
-- Future Job mechanism — pool pre-sends `NewExtendedMiningJob` with `min_ntime` unset before the
-  full template is ready, activates instantly via `SetNewPrevHash` — directly addresses latency
+- Future Job mechanism: pool pre-sends `NewExtendedMiningJob` with `min_ntime` unset before the
+  full template is ready, activates instantly via `SetNewPrevHash` ,  directly addresses latency
 - Native SV2 miner connections (future path for Bitshoka and similar hardware)
 
 **We explicitly do NOT use:**
 
-- Job Declaration Protocol (JDP) — miners do not select transactions in Braidpool; the pool builds
+- Job Declaration Protocol (JDP),  miners do not select transactions in Braidpool; the pool builds
   templates via its own `ipc_template_consumer`
 - Template Distribution Protocol (TDP) — Braidpool uses direct Bitcoin Core IPC (Cap'n Proto)
 - `roles_logic_sv2` — SRI's opinionated role helper that bundles JDP/TDP assumptions
@@ -46,7 +44,7 @@ initial data gathering but has three production-scale problems:
 
 ---
 
-## 3. Prerequisites — Merge Before Starting SV2 Work
+## 3. Prerequisites — Merge Before SV2 Work
 
 ```
 #492 (GlobalJobStore)   ← merge FIRST; gives share handler a clean single-lookup API
@@ -181,12 +179,11 @@ in audit mode or normal mode.
 
 ---
 
-## 7. The Five PRs
+## 7. The  PRs
 
 ### PR 1 — Template Adapter Stub (braidpool/sv2-apps)
 
 **Branch:** `braidpool/pool-template-adapter`  
-**Size:** ~150 lines
 
 Replaces the template source in `pool-apps/pool/` — instead of receiving templates from
 `bitcoin-core-sv2` via TDP, the pool accepts a `tokio::sync::mpsc::Receiver<BraidpoolTemplate>`.
@@ -222,7 +219,6 @@ separator) produces a `BraidpoolTemplate` with correct prefix/suffix split.
 ### PR 2 — Noise Channel Manager (braidpool/sv2-apps)
 
 **Branch:** `braidpool/noise-channel-manager`  
-**Size:** ~200 lines
 
 Wires the pool to accept `NoiseTcpStream` connections from tproxy. Pool generates a static authority
 keypair on startup (stored in config), performs NX-handshake as server, opens an Extended Channel.
@@ -250,7 +246,6 @@ The `channel_manager.rs` module handles:
 ### PR 3 — Share→Bead Bridge (braidpool/sv2-apps)
 
 **Branch:** `braidpool/share-bead-bridge`  
-**Size:** ~180 lines
 
 When pool receives `SubmitSharesExtended`, validates PoW and calls the bead creation path via a
 channel sender.
@@ -281,7 +276,7 @@ one `ValidatedShare` with correct fields, assert `SubmitSharesSuccess` is sent u
 ### PR 4 — Wire Pool Into Braidpool Node (braidpool/braidpool)
 
 **Branch:** `feat/sv2-pool-wiring`  
-**Size:** ~250 lines across `node/src/main.rs`, new `node/src/sv2/mod.rs`
+`node/src/main.rs`, new `node/src/sv2/mod.rs`
 
 #### NotifyCmd fanout — required change
 
@@ -347,7 +342,7 @@ the mock tproxy socket.
 ### PR 5 — Translator Binary (braidpool/braidpool)
 
 **Branch:** `feat/sv2-translator-wiring`  
-**Size:** ~300 lines, new `translator/` binary crate at workspace root
+ new `translator/` binary crate at workspace root
 
 Introduces a standalone binary that runs alongside the node:
 
@@ -422,16 +417,14 @@ conflict in a standalone dependency-only commit before the first PR.
 |---------|-------|
 | §4 | Noise protocol handshake |
 | §5.1.2 | Extended Job and Extended Extranonce (extranonce subdivision model) |
-| §5.1.3 | Future Job (latency win — requires `height` field) |
+| §5.1.3 | Future Job (latency win, requires `height` field) |
 | §5.3.15/5.3.16 | `NewMiningJob` and `NewExtendedMiningJob` message fields |
 | §5.3.17 | `SetNewPrevHash` |
 | §5.3.11/5.3.12 | `SubmitSharesStandard` and `SubmitSharesExtended` |
 
 ---
 
-## 11. Audit Findings Summary
-
-All ten findings from the code audit against `dev@360f7b8` — all genuine blockers:
+## 11. Audit Findings Summary(bugs)
 
 | # | Finding | Impact | Location |
 |---|---------|--------|----------|
@@ -446,6 +439,4 @@ All ten findings from the code audit against `dev@360f7b8` — all genuine block
 | 9 | MiningJobMap is per-peer pre-#492 | Complex two-level lookup in share bridge | main.rs:234 |
 | 10 | Placeholder pubkey/sig hardcoded in two places | Security placeholder silently inherited | lib.rs:322, stratum.rs:1303 |
 
----
 
-*Last updated: 2026-09-01. Audit performed against braidpool dev@360f7b8.*
