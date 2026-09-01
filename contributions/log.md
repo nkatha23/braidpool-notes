@@ -3,8 +3,12 @@
 ## Merged PRs
 
 ### [PR #472](https://github.com/braidpool/braidpool/pull/472) — fix(stratum): derive extranonce1 from atomic connection_id counter
-Closes issue #461. Replaced RNG-based extranonce1 with `AtomicU32` counter
-so each miner gets a unique nonce partition. Added test asserting uniqueness.
+Closes issue #461. Added `NEXT_CONNECTION_ID: AtomicU32` for per-connection
+logging identity. **Note:** After PR #509 (audit-main merge), `DownstreamClient::default()`
+was refactored and extranonce1 reverted to 4-byte random bytes (`UPSTREAM_EXTRANONCE1_SIZE`)
+with a FIXME "should be connection_id". The atomic counter now only drives
+the `connection_id` logging field, not the actual extranonce1 bytes. This is
+an outstanding follow-up item.
 
 ### [PR #477](https://github.com/braidpool/braidpool/pull/477) — fix(tests): replace hardcoded stratum ports with OS-assigned port 0
 Fixed `AddrInUse` test failures documented across PRs #309 and #474.
@@ -13,6 +17,9 @@ Added oneshot channel to `run_stratum_service` for tests to discover bound port.
 ### [PR #475](https://github.com/braidpool/braidpool/pull/475) — feat: extend extranonce1 and extranonce2 to 8 bytes each
 Extends both extranonce fields from `u32` to `u64`. Propagates through
 stratum, uncommitted metadata, consensus encoding, DB layer, test utilities.
+**Note:** Post-#509, the assigned extranonce1 in normal mode regressed to 4 bytes
+(`UPSTREAM_EXTRANONCE1_SIZE`). `EXTRANONCE1_SIZE = 8` (lib.rs) survives as the
+coinbase separator-search width, and `EXTRANONCE2_SIZE = 8` remains fully in effect.
 
 ### [PR #479](https://github.com/braidpool/braidpool/pull/479) — refactor(stratum): move TcpListener binding to caller
 `run_stratum_service` accepts a ready `TcpListener`. Caller binds the socket.

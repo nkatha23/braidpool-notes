@@ -9,9 +9,15 @@ Bitcoin mining iterates through a 4-byte nonce field in the block header.
 Modern ASICs exhaust 4 billion values in milliseconds.
 
 Extranonce extends the search space via the coinbase transaction:
-- `extranonce1`: assigned by pool, unique per miner connection (8 bytes)
+- `extranonce1`: assigned by pool, unique per miner connection (**4 bytes** in current code — see note)
 - `extranonce2`: rolled by miner, fresh search space per job (8 bytes)
-- Total: 16 bytes = 2^128 combinations
+- Total: 12 bytes in practice; 2^64 extranonce2 combinations per miner
+
+> **Note:** PRs #472 + #475 targeted 8-byte extranonce1 using an `AtomicU32` counter.
+> After the audit-main merge (#509), `DownstreamClient::default()` regressed to
+> `UPSTREAM_EXTRANONCE1_SIZE = 4` bytes (random, not counter-based). A FIXME comment
+> in the code marks this as unresolved. See
+> [`stratum-internals.md §4`](../stratum/stratum-internals.md) for details.
 
 A **bead** is a weak block — meets pool difficulty but not Bitcoin difficulty.
 It proves the miner did real SHA256 work. Contains:

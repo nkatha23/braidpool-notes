@@ -115,26 +115,33 @@ stored in `DownstreamClient.downstream_ip` and later embedded in the bead's
 
 ## 4. Extranonce1 — Assignment, Size, and Uniqueness
 
-### Constants (lib.rs ~line 98)
+### Constants (lib.rs ~line 117)
 
 ```rust
-pub const EXTRANONCE1_SIZE: usize = 8;      // 8 bytes per miner
+pub const EXTRANONCE1_SIZE: usize = 8;      // used for separator search in coinbase
 pub const EXTRANONCE2_SIZE: usize = 8;      // 8 bytes miner-controlled
-// Together: 16 bytes total extranonce space in the coinbase scriptSig
+// EXTRANONCE1_SIZE is NOT the size sent to miners — see note below
 ```
 
-### Per-Connection Generation (stratum.rs ~line 1087)
+There is also a module-local constant in `stratum.rs`:
 
 ```rust
-// A global atomic counter gives each connection a unique ID for logging
+const UPSTREAM_EXTRANONCE1_SIZE: usize = 4; // Standard upstream extranonce1 size
+```
+
+### Per-Connection Generation (stratum.rs ~line 1882)
+
+```rust
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(0);
 
 impl Default for DownstreamClient {
     fn default() -> Self {
         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::SeqCst);
-        let extranonce1_bytes = random::<u64>().to_be_bytes();  // cryptographically random
-        let extranonce1_hex = hex::encode(extranonce1_bytes);
+        let mut extranonce1_bytes = [0; UPSTREAM_EXTRANONCE1_SIZE]; // 4 bytes
+        rand::thread_rng().fill_bytes(&mut extranonce1_bytes);
+        let extranonce1_hex = hex::encode(&extranonce1_bytes); // FIXME should be connection_id
         DownstreamClient {
+            connection_id,
             extranonce1: Vec::from(extranonce1_bytes),
             extranonce2_len: EXTRANONCE2_SIZE,
             ...
@@ -143,23 +150,28 @@ impl Default for DownstreamClient {
 }
 ```
 
-`rand::random::<u64>()` is used instead of the connection counter for the
-actual extranonce bytes. This is intentional: two nodes running simultaneously
-would have overlapping sequential counters, but random 64-bit values give
-near-zero collision probability across the entire pool.
+> **Regression note (post-#509):** PR #472 intended to replace RNG with the
+> `AtomicU32` counter for extranonce1 uniqueness; PR #475 extended it to 8 bytes.
+> After the audit-main merge (#509), `DownstreamClient::default()` was refactored
+> to use `UPSTREAM_EXTRANONCE1_SIZE = 4` bytes with random fill, and the FIXME
+> comment "should be connection_id" marks this as unfinished. In normal (non-audit)
+> mode the extranonce1 sent to miners is currently **4 bytes, not 8**. Tests confirm:
+> `assert_eq!(client.extranonce1.len(), UPSTREAM_EXTRANONCE1_SIZE)`.
+> `EXTRANONCE1_SIZE = 8` survives only as the separator-search width in the coinbase.
 
 ### Returned to Miner in mining.subscribe
 
 ```rust
-// stratum.rs ~line 1073
-let extranonce1_hex_str = hex::encode(self.extranonce1.clone());
-json!([subscriptions, extranonce1_hex_str, self.extranonce2_len])
-// e.g. [..., "000000009495ac08", 8]
+// stratum.rs ~line 1849
+let extranonce1_hex_str = hex::encode(&self.extranonce1);
+json!([subscriptions, extranonce1_hex_str, extranonce2_size_for_miner])
+// Normal mode e.g. [..., "9495ac08", 8]   ← 4-byte hex (8 chars), extranonce2=8
 ```
 
-The miner is told: "your extranonce1 is this 8-byte hex string; you control
-8 bytes of extranonce2." Total nonce space per miner: 2^64 extranonce2
-combinations before the pool needs to reassign extranonce1.
+The miner is told: "your extranonce1 is this 4-byte hex string (8 hex chars);
+you control 8 bytes of extranonce2." Total nonce space per miner: 2^64 from
+extranonce2 alone. The intended fix (tracking by `connection_id`) is marked
+with the FIXME comment and should be addressed in a follow-up PR.
 
 ---
 
@@ -178,8 +190,15 @@ The pool pre-splits the coinbase transaction into `coinbase1` and `coinbase2`
 with the extranonce slot in between:
 
 ```
-full coinbase = coinbase1 + extranonce1 (8 bytes) + extranonce2 (8 bytes) + coinbase2
+full coinbase = coinbase1 + extranonce1 (4 bytes, normal mode) + extranonce2 (8 bytes) + coinbase2
 ```
+
+> The template coinbase is split at a 16-byte `EXTRANONCE_SEPARATOR` (`[0x01; 16]`).
+> On submit, the pool searches for this sentinel, takes everything before it as
+> `coinbase1` and everything after as `coinbase2`, then concatenates
+> `coinbase1 + extranonce1 (4 bytes) + extranonce2 (8 bytes) + coinbase2`.
+> The separator acts purely as a split marker; it is not part of the final coinbase.
+> See `windows(EXTRANONCE1_SIZE + EXTRANONCE2_SIZE)` in `handle_submit` (~line 2238).
 
 On submit, the pool reconstructs:
 
