@@ -424,7 +424,7 @@ conflict in a standalone dependency-only commit before the first PR.
 
 ---
 
-## 11. Audit Findings Summary(bugs)
+## 11. Audit Findings Summary
 
 | # | Finding | Impact | Location |
 |---|---------|--------|----------|
