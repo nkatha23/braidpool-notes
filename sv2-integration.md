@@ -1,304 +1,385 @@
-# Braidpool SV2 Integration — Implementation Document
+# Braidpool SV2 Integration — Updated Implementation Document v2
+
+## Reference Links
+
+- **Sansh's reference branch**: https://github.com/braidpool/braidpool/tree/sv2-integration-braidpool
+- **SV2 apps fork**: https://github.com/braidpool/sv2-apps
 
 ---
 
-## 1. The Problem
+## 1. Problem and Motivation
 
-Bitcoin mining today is dominated by centralized pools. Miners trust a single operator to pay them
-correctly, select transactions fairly, and not steal block rewards. P2Pool attempted decentralization
-but died because hardware manufacturers hard-limited coinbase transaction size.
+Bitcoin mining is 80%+ centralized. Braidpool solves this with a DAG-based weak block protocol where every valid share becomes a bead in a directed acyclic graph, consensus is established by graph structure, and payouts are enforced by FROST threshold signatures with no trusted operator.
 
-Braidpool solves this with a DAG-based weak block protocol ("braid"). Every valid share becomes a
-"bead" in a directed acyclic graph. Consensus on who contributed what work is established by graph
-structure, not by a trusted operator. Payouts are enforced by FROST threshold signatures.
-
-The current stratum layer is Stratum V1 TCP, hand-rolled in `node/src/stratum.rs`. This works for
-initial data gathering but has three production-scale problems:
-
-- No authentication between pool components (MITM can inject jobs)
-- No Future Job mechanism (latency to new work unit is high)
-- No native path for SV2-capable hardware like Bitshoka
+The current stratum layer is hand-rolled SV1 TCP in `node/src/stratum.rs`. Three production blockers:
+- No authentication between pool components — MITM can inject fake jobs
+- No Future Job mechanism — template propagation latency is high
+- No native path for SV2 hardware (Bitshoka, future ASICs)
 
 ---
 
 ## 2. What SV2 Gives Braidpool
 
-**We use SV2 for:**
+**Used:**
+- Noise NX-handshake encrypted channel between pool and translator proxy — pool authenticates with static authority keypair, prevents job injection
+- Extended Channel for pool↔tproxy job distribution — one channel, tproxy subdivides extranonce space downstream
+- Future Job — pool pre-sends `NewExtendedMiningJob` with `min_ntime` unset, activates instantly via `SetNewPrevHash`, cuts template propagation latency dramatically
+- Native SV2 miner support (future path for Bitshoka)
 
-- Noise protocol encrypted channel between pool and translator proxy (NX-handshake, NoiseTcpStream)
-, the pool authenticates with a static keypair, preventing job injection
-- Extended Channel for pool↔tproxy job distribution — one channel carries all miners' work,
-  tproxy subdivides the extranonce space
-- Future Job mechanism: pool pre-sends `NewExtendedMiningJob` with `min_ntime` unset before the
-  full template is ready, activates instantly via `SetNewPrevHash` ,  directly addresses latency
-- Native SV2 miner connections (future path for Bitshoka and similar hardware)
-
-**We explicitly do NOT use:**
-
-- Job Declaration Protocol (JDP),  miners do not select transactions in Braidpool; the pool builds
-  templates via its own `ipc_template_consumer`
-- Template Distribution Protocol (TDP) — Braidpool uses direct Bitcoin Core IPC (Cap'n Proto)
-- `roles_logic_sv2` — SRI's opinionated role helper that bundles JDP/TDP assumptions
-- `bitcoin-core-sv2` — SRI's library for connecting Bitcoin Core to TDP; Braidpool's existing IPC
-  pipeline replaces it
+**Explicitly NOT used:**
+- Job Declaration Protocol (JDP) — miners don't select transactions in Braidpool
+- Template Distribution Protocol (TDP) — replaced by Braidpool's own IPC pipeline
+- `roles_logic_sv2` — bundles JDP/TDP assumptions
+- `bitcoin-core-sv2` — replaced by `braidpool-template-provider`
 
 ---
 
-## 3. Prerequisites — Merge Before SV2 Work
+## 3. Repository Architecture Decision
+
+Two separate forks, as Sansh confirmed:
 
 ```
-#492 (GlobalJobStore)   ← merge FIRST; gives share handler a clean single-lookup API
-#503 (share counters)   ← merge after #492
+braidpool/sv2-apps   ← SV2 protocol layer (pool, translator, template provider)
+braidpool/braidpool  ← Node wiring, bead bridge, main.rs changes
 ```
 
-**Why #492 matters:** The current `dev` branch uses a two-level per-peer job map:
-`HashMap<peer_addr, Arc<Mutex<MiningJobMap>>>`. PR 3's share bridge would need to map
-`channel_id → peer_addr → MiningJobMap` — fragile. After #492, `GlobalJobStore.get(job_id)`
-returns `(Arc<JobDetails>, TemplateId)` in one call. Write the SV2 PRs against the post-#492 world.
+`braidpool-common` is the shared type boundary between the two repos. It currently exports `PoolNetwork` and `Cpunet`. It needs to also export or re-export the types that sv2-apps needs from the node — specifically anything the template provider consumes.
+
+**Why split repos:**
+- SRI upstream changes can be absorbed in sv2-apps without touching braidpool node
+- SV2 protocol reviewers can review sv2-apps independently
+- Braidpool node PRs stay small — only wiring, not SV2 implementation
+
+**Maintenance cost:** When `braidpool-common` types change, sv2-apps dependency must be updated. When `NotifyCmd` or `BlockTemplate` fields change in node, sv2-apps pool crate may need updating.
 
 ---
 
-## 4. Key Files to Read Before Writing Code
+## 4. Key Finding from Sansh's Branch
 
-### In `braidpool/braidpool`
+Sansh's `sv2-integration-braidpool` branch (commits from `171a9a4` onwards) contains the reference implementation. His architecture reveals three critical design decisions that supersede our earlier analysis:
+
+### 4.1 Coinbase source — `processed_block_hex`, not separator scan
+
+Our earlier doc said to scan for `EXTRANONCE_SEPARATOR = [1u8; 16]`. Sansh's approach is better:
+
+`template_creator.rs` already builds the complete Braidpool coinbase (with OP_RETURN commitment) and stores it in `block_template.processed_block_hex` as a serialized `bitcoin::Block`. The template provider deserializes this block, extracts the coinbase transaction, and passes it to `build_new_template`.
+
+```rust
+// braidpool-template-provider/src/sv2_messages.rs
+let coinbase_tx: Transaction = if let Some(processed_hex) = &block_template.processed_block_hex {
+    if !processed_hex.is_empty() {
+        let block: bitcoin::Block = deserialize(processed_hex)?;
+        block.txdata[0].clone()  // coinbase is always first transaction
+    } else {
+        // fallback to components.coinbase_transaction
+        deserialize(&components.coinbase_transaction)?
+    }
+} else {
+    deserialize(&components.coinbase_transaction)?
+};
+```
+
+`processed_block_hex` lives in `node/src/ipc.rs` at line 473. It is set by `template_creator.rs` during block template processing. It is NOT in `braidpool-common` — this is a dependency to resolve (see section 7).
+
+### 4.2 Coinbase split in braidpool mode
+
+In `build_new_template`, when `braidpool_mode = true`, ALL outputs are included:
+
+```rust
+// sv2_messages.rs — build_new_template
+let outputs_to_include: Vec<_> = if braidpool_mode {
+    // Include ALL: reward[0] + segwit[1] + OP_RETURN[2]
+    coinbase_tx.output.iter().cloned().collect()
+} else {
+    // Standard SRI: only reward output
+    vec![coinbase_tx.output[0].clone()]
+};
+```
+
+The pool's `factory.rs` then uses these outputs directly as `coinbase_tx_prefix` for downstream miners. This means the OP_RETURN commitment travels in the coinbase outputs, which are part of `coinbase_tx_suffix` in the serialized transaction (outputs come after inputs). The `NewTemplate` message carries `coinbase_tx_outputs` separately as a field — this is TDP-specific and not the same as the Extended Channel's `coinbase_tx_prefix`/`coinbase_tx_suffix` split. The factory handles the reassembly.
+
+### 4.3 BeadContext and Schnorr keys in SwarmHandler
+
+`SwarmHandler::new()` now takes `auth_key_secret: Secp256k1SecretKey` and `auth_key_public: Secp256k1PublicKey`. This fixes audit finding 10 — the hardcoded placeholder key. The authority keypair from the Noise handshake flows into bead commitment signing.
+
+```rust
+// pool/src/lib/braidpool/mod.rs
+let (swarm_handler, swarm_command_receiver) = SwarmHandler::new(
+    Arc::clone(&self.braid),
+    db_tx.clone(),
+    auth_key_secret,
+    auth_key_public,
+);
+```
+
+`BraidpoolP2P::spawn()` now returns `Arc<tokio::sync::Mutex<SwarmHandler>>` as an additional return value so the pool can call `propagate_valid_bead` through it.
+
+---
+
+## 5. Key Files to Read
+
+**In `braidpool/braidpool` (upstream/dev):**
 
 | File | What to understand |
-|------|--------------------|
-| `node/src/stratum.rs` | `handle_submit`, `propagate_valid_bead`, `NotifyCmd`, `Notifier`, `ConnectionMapping`, `DownstreamClient`, `construct_job_notification` (coinbase split at line 2236) |
-| `node/src/lib.rs` | `ipc_template_consumer`, `SwarmHandler::propagate_valid_bead`, `EXTRANONCE1_SIZE=8`, `EXTRANONCE2_SIZE=8`, `EXTRANONCE_SEPARATOR=[1u8;16]` |
-| `node/src/audit.rs` | `UPSTREAM_EXTRANONCE1_BYTES=4`, `MINER_PREFIX_BYTES=2`, `COMMITMENT_BYTES=5`, `TOTAL_EXTRANONCE1_BYTES=11` |
-| `node/src/ipc/client.rs` | `SharedBitcoinClient` — how templates arrive from Bitcoin Core |
-| `node/src/config.rs` | Uses `bitcoin::Network` with custom `CPUNet` variant (no `PoolNetwork` enum) |
-| `node/src/template_creator.rs` | Coinbase construction — output order: reward[0], segwit[1], OP_RETURN[2] |
-| `node/src/main.rs` | Component wiring, `notification_tx` is `mpsc::channel` (single consumer) |
+|------|-------------------|
+| `node/src/ipc.rs:473` | `processed_block_hex` field — where the complete Braidpool coinbase lives |
+| `node/src/template_creator.rs` | How `processed_block_hex` is populated — the coinbase with OP_RETURN |
+| `node/src/lib.rs` | `ipc_template_consumer`, `EXTRANONCE_SEPARATOR`, `EXTRANONCE1_SIZE=8`, `EXTRANONCE2_SIZE=8` |
+| `node/src/stratum.rs` | `handle_submit`, `GlobalJobStore`, `construct_job_notification`, `NotifyCmd` |
+| `node/src/main.rs` | `notification_tx = mpsc::channel` — single consumer, needs broadcast fanout |
+| `braidpool-common/src/lib.rs` | Currently exports only cpunet and error — shared type boundary |
+| `node/src/config.rs` | `bitcoin::Network` with CPUNet variant — no `PoolNetwork` enum |
 
-### In `braidpool/sv2-apps`
+**In Sansh's `sv2-integration-braidpool` branch (from `171a9a4`):**
+
+| File | What to understand |
+|------|-------------------|
+| `braidpool-template-provider/src/lib.rs` | `sv2_template_consumer` — sibling to `ipc_template_consumer`, waits for `CoinbaseOutputConstraints` |
+| `braidpool-template-provider/src/sv2_messages.rs` | `build_new_template`, `build_new_template_from_block_template`, `build_block_submission_request` |
+| `pool/src/lib/braidpool/mod.rs` | `BeadContext`, `BraidpoolP2P::spawn` with auth keys, `SwarmHandler` returned |
+| `pool/src/lib/channel_manager/mining_message_handler.rs` | `SubmitShareExtended` handling, bead creation path |
+| `sv2/channels-sv2/src/server/jobs/factory.rs` | How `NewExtendedMiningJob` is built from `NewTemplate` in braidpool mode |
+
+**In `braidpool/sv2-apps` fork (upstream synced):**
 
 | Path | What to understand |
-|------|--------------------|
-| `pool-apps/pool/src/` | SRI's pool — channel management, `NewExtendedMiningJob`, `SubmitSharesExtended` |
-| `miner-apps/translator/src/` | SRI's translator — SV1 downstream, SV2 upstream, extranonce subdivision |
-| `stratum-apps/src/` | Noise connection helpers, key management, TOML config |
+|------|-------------------|
+| `pool-apps/pool/src/` | SRI's pool — what we're adapting, not replacing |
+| `miner-apps/translator/src/` | SRI's translator — extranonce subdivision, SV1↔SV2 translation |
+| `stratum-apps/src/` | Noise helpers, key management — use as-is |
 
 ---
 
-## 5. The Coinbase Split — Most Critical Detail (Corrected)
+## 6. The Dependency Problem — `processed_block_hex`
 
-### How the split actually works (stratum.rs:2236–2247)
+`block_template.processed_block_hex` is defined in `node/src/ipc.rs`. The sv2-apps pool crate cannot import from `node` directly without creating a circular dependency (`node` → `sv2-apps pool` → `node`).
 
-The Notifier does NOT split at a byte offset derived from `EXTRANONCE1_SIZE`/`EXTRANONCE2_SIZE`.
-It scans the serialized coinbase bytes for the `EXTRANONCE_SEPARATOR` pattern:
+Three options:
 
-```rust
-// stratum.rs:2236-2247
-let separator_pos = deserialized_coinbase
-    .as_slice()
-    .windows(EXTRANONCE1_SIZE + EXTRANONCE2_SIZE)  // 16-byte window
-    .position(|window| window == EXTRANONCE_SEPARATOR)  // [1u8; 16]
-    ...
-let coinbase_1 = hex::encode(&deserialized_coinbase[..separator_pos]);
-let coinbase_2 = hex::encode(&deserialized_coinbase[separator_pos + 16..]);
-```
+- **Option A** — move `BlockTemplate` to `braidpool-common`. The template type becomes a shared type, both node and sv2-apps import it from there. Clean but requires a prerequisite PR.
+- **Option B** — sv2-apps takes node as a git dependency. Sansh's branch already does this (`use node::ipc::BlockTemplate`). Creates coupling but avoids restructuring.
+- **Option C** — define a minimal `BraidpoolTemplate` struct in `braidpool-common` that carries only what sv2-apps needs: `coinbase_tx_prefix`, `coinbase_tx_suffix`, `merkle_path`, `prev_hash`, `nbits`, `version`, `height`. Node converts `BlockTemplate → BraidpoolTemplate` before sending over the channel.
 
-`adapt_notify_cmd` must use the same scan:
-
-```rust
-let separator = [1u8; EXTRANONCE1_SIZE + EXTRANONCE2_SIZE]; // [1u8; 16]
-let separator_pos = deserialized_coinbase
-    .windows(separator.len())
-    .position(|w| w == separator)
-    .ok_or(AdaptError::SeparatorNotFound)?;
-
-let coinbase_tx_prefix = deserialized_coinbase[..separator_pos].to_vec();
-let coinbase_tx_suffix = deserialized_coinbase[separator_pos + separator.len()..].to_vec();
-```
-
-### OP_RETURN is in `coinbase_tx_suffix`, not prefix
-
-All Bitcoin outputs follow all inputs in the serialized transaction. The extranonce is embedded in
-the coinbase **input's** `script_sig`. Therefore everything after the extranonce — including all
-outputs — lands in `coinbase_tx_suffix` (coinbase2).
-
-Output order from `build_braidpool_coinbase_from_template` (template_creator.rs:424-429):
-```
-output[0] → reward payout        → in coinbase_tx_suffix
-output[1] → segwit commitment    → in coinbase_tx_suffix (if present)
-output[2] → OP_RETURN commitment → in coinbase_tx_suffix
-```
-
-The OP_RETURN is NOT "the first output in coinbase_tx_prefix." The current code is correct;
-`adapt_notify_cmd` just replicates the scan.
-
-### Mapping to SV2 Extended Channel fields
-
-```
-coinbase_tx_prefix  = coinbase1   (everything before the 16-byte separator)
-extranonce_prefix   = extranonce1 (pool-assigned, per tproxy connection)
-extranonce          = extranonce2 (tproxy/miner-controlled)
-coinbase_tx_suffix  = coinbase2   (everything after the 16-byte separator, includes all outputs)
-```
+**Recommended: Option C.** It keeps the dependency boundary clean, `braidpool-common` is already the shared crate, and `BraidpoolTemplate` is small enough to define without restructuring node. This is PR 0 — a prerequisite that unblocks everything.
 
 ---
 
-## 6. Extranonce Layout (Corrected)
+## 7. Extranonce Layout (Confirmed Correct)
 
-The proposal incorrectly stated extranonce1 = 8 bytes. **Actual values from the codebase:**
-
+From `node/src/stratum.rs:38`:
 ```rust
-// stratum.rs:38
 const UPSTREAM_EXTRANONCE1_SIZE: usize = 4; // actual extranonce1 sent to miners
-
-// lib.rs
-pub const EXTRANONCE1_SIZE: usize = 8;   // half of separator (not the actual ext1 size)
-pub const EXTRANONCE2_SIZE: usize = 8;   // miner rolls this
-pub const EXTRANONCE_SEPARATOR: [u8; 16] = [1u8; 16]; // placeholder in coinbase
 ```
 
-### Normal mode
-
-```
-extranonce_prefix   = 4 bytes   (pool-assigned per tproxy connection, randomly generated)
-extranonce          = 12 bytes  (tproxy controls: 8 miner-rolls + 4 reserved)
-total space         = 16 bytes  (= EXTRANONCE1_SIZE + EXTRANONCE2_SIZE = separator size)
-```
-
-`OpenExtendedMiningChannel.Success` must carry `extranonce_size = 12`.
-
-### Audit mode
-
-```
-extranonce_prefix   = 11 bytes  (upstream_ext1[4] + miner_prefix[2] + commitment[5])
-extranonce          = 5 bytes   (1 miner-roll byte + 4 unused)
-total space         = 16 bytes  (same separator)
+From `node/src/lib.rs`:
+```rust
+pub const EXTRANONCE1_SIZE: usize = 8;      // half of separator size
+pub const EXTRANONCE2_SIZE: usize = 8;      // miner-controlled
+pub const EXTRANONCE_SEPARATOR: [u8; 16] = [1u8; 16];
 ```
 
-`OpenExtendedMiningChannel.Success` must carry `extranonce_size = 5` in audit mode.
+**Normal mode Extended Channel:**
+```
+extranonce_prefix = 4 bytes  (pool-assigned, random per tproxy connection)
+extranonce        = 12 bytes (tproxy controls: 8 miner-rolls + 4 reserved)
+total             = 16 bytes (matches separator size)
+OpenExtendedMiningChannel.Success: extranonce_size = 12
+```
 
-The channel manager must negotiate different `extranonce_size` based on whether the node is running
-in audit mode or normal mode.
+**Audit mode:**
+```
+extranonce_prefix = 11 bytes (upstream_ext1[4] + miner_prefix[2] + commitment[5])
+extranonce        = 5 bytes
+OpenExtendedMiningChannel.Success: extranonce_size = 5
+```
 
 ---
 
-## 7. The  PRs
+## 8. The PRs — Updated
 
-### PR 1 — Template Adapter Stub (braidpool/sv2-apps)
+### PR 0 — Add `BraidpoolTemplate` to `braidpool-common`
 
-**Branch:** `braidpool/pool-template-adapter`  
-
-Replaces the template source in `pool-apps/pool/` — instead of receiving templates from
-`bitcoin-core-sv2` via TDP, the pool accepts a `tokio::sync::mpsc::Receiver<BraidpoolTemplate>`.
+**Target:** `braidpool/braidpool`  **Branch:** `feat/braidpool-common-template-type`
 
 ```rust
+// braidpool-common/src/lib.rs
+pub mod template;
+
+// braidpool-common/src/template.rs
+#[derive(Debug, Clone)]
 pub struct BraidpoolTemplate {
     pub coinbase_tx_prefix: Vec<u8>,   // bytes before EXTRANONCE_SEPARATOR
-    pub coinbase_tx_suffix: Vec<u8>,   // bytes after EXTRANONCE_SEPARATOR (includes all outputs)
+    pub coinbase_tx_suffix: Vec<u8>,   // bytes after EXTRANONCE_SEPARATOR (all outputs)
     pub merkle_path: Vec<[u8; 32]>,
     pub prev_hash: [u8; 32],
     pub nbits: u32,
     pub version: i32,
-    pub height: u32,        // from ipc_template.components — required for Future Job
+    pub height: u32,                   // from ipc_template.components — required for Future Job
     pub template_id: u64,
-}
-
-pub async fn adapt_notify_cmd(
-    notify: NotifyCmd,
-    ipc_components: &BlockTemplateComponents,  // provides height
-) -> Option<BraidpoolTemplate> {
-    // Scans for EXTRANONCE_SEPARATOR, splits coinbase, maps fields
-    // Returns None for non-SendToAll variants
+    pub coinbase_tx: Vec<u8>,          // full serialized coinbase — for build_new_template
 }
 ```
 
-**Critical:** `height` must come from `ipc_template.components` (Cap'n Proto IPC data), NOT from
-`BlockTemplate` which leaves `height = Height::ZERO` in `ipc_template_consumer`. This field is
-required for `NewExtendedMiningJob` and the Future Job latency mechanism.
+Node's `ipc_template_consumer` converts `Arc<BlockTemplate> → BraidpoolTemplate` using `processed_block_hex` as the coinbase source. This gets sent over the notification channel alongside `NotifyCmd`.
 
-**Test:** Unit test that a `NotifyCmd::SendToAll` with known coinbase bytes (containing the 16-byte
-separator) produces a `BraidpoolTemplate` with correct prefix/suffix split.
+**Test:** Round-trip — build a `BraidpoolTemplate` from a known `BlockTemplate`, verify prefix+suffix reconstruct correctly when rejoined at the separator boundary.
 
-### PR 2 — Noise Channel Manager (braidpool/sv2-apps)
+---
 
-**Branch:** `braidpool/noise-channel-manager`  
+### PR 1 — `braidpool-template-provider` crate in sv2-apps
 
-Wires the pool to accept `NoiseTcpStream` connections from tproxy. Pool generates a static authority
-keypair on startup (stored in config), performs NX-handshake as server, opens an Extended Channel.
+**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/pool-template-adapter`  
+**Reference:** Sansh's `c6fddf8`, `203e935`, `f502db7`, `6c85bda`
 
-Add to pool config TOML:
+New crate at `stratum-apps/braidpool-template-provider/`:
+
 ```toml
-[authority]
-public_key = "..."   # secp256k1 static key, hex
-secret_key = "..."
+# Cargo.toml
+[dependencies]
+braidpool-common = { git = "https://github.com/braidpool/braidpool", branch = "dev" }
+mining_sv2 = "10"
+template_distribution_sv2 = "3"
+binary_sv2 = "5"
+tokio = { workspace = true }
+tracing = { workspace = true }
 ```
 
-The `channel_manager.rs` module handles:
-- `SetupConnection` from tproxy → `SetupConnection.Success`
-- `OpenExtendedMiningChannel` → `OpenExtendedMiningChannel.Success` with:
-  - `extranonce_prefix` = 4 bytes (normal mode) randomly generated per connection
-  - `extranonce_size` = 12 (normal mode) or 5 (audit mode)
-- Connection lifecycle (one tproxy per pool connection for now)
+Key function — `sv2_template_consumer`:
+```rust
+pub async fn sv2_template_consumer(
+    mut template_rx: mpsc::Receiver<BraidpoolTemplate>,  // from braidpool-common, not node
+    sv2_outgoing_tx: Sender<TemplateDistribution<'static>>,
+    sv2_incoming_rx: Receiver<TemplateDistribution<'static>>,
+    cancellation_token: CancellationToken,
+) -> Result<(), BraidpoolTemplateProviderError>
+```
 
-**Note:** extranonce1 is randomly generated (`rand::thread_rng().fill_bytes()`), NOT derived from
-`connection_id`. The `PoolNetwork` enum does not exist — use `bitcoin::Network` directly.
+Key function — `build_new_template`:
+```rust
+pub fn build_new_template<'a>(
+    template: &BraidpoolTemplate,
+    future_template: bool,
+) -> Result<NewTemplate<'a>, TemplateDataError> {
+    // Use template.coinbase_tx directly (already built by template_creator)
+    // braidpool_mode = true: include ALL outputs in coinbase_tx_outputs
+    // This carries reward + segwit + OP_RETURN commitment through to factory.rs
+}
+```
 
-**Test:** Spin up pool and mock tproxy in-process, complete Noise handshake, assert
-`SetupConnection.Success` with correct `extranonce_size` for both normal and audit modes.
+Key function — `build_new_template_from_block_template` (kept for compatibility):
+```rust
+// Uses BraidpoolTemplate.coinbase_tx (serialized full coinbase)
+// instead of processed_block_hex deserialization
+// Eliminates the fallback chain Sansh needed
+```
 
-### PR 3 — Share→Bead Bridge (braidpool/sv2-apps)
+**Test:** Unit test — `BraidpoolTemplate` with known coinbase produces `NewTemplate` with correct `coinbase_tx_outputs` count (3: reward + segwit + OP_RETURN).
 
-**Branch:** `braidpool/share-bead-bridge`  
+---
 
-When pool receives `SubmitSharesExtended`, validates PoW and calls the bead creation path via a
-channel sender.
+### PR 2 — Noise channel manager in sv2-apps pool
+
+**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/noise-channel-manager`  
+**Reference:** Sansh's `20fd115`, `9e3473d`
+
+Adapts `pool-apps/pool/` to accept `BraidpoolTemplate` instead of TDP templates.
+
+Key struct addition — `BeadContext`:
+```rust
+// pool-apps/pool/src/lib/braidpool/mod.rs
+pub struct BeadContext {
+    pub template_id: u64,
+    pub template_propagation_time: std::time::Instant,
+    pub transactions: Vec<bitcoin::Transaction>,  // for CommittedMetadata
+}
+```
+
+Key change — `BraidpoolP2P::spawn` signature:
+```rust
+pub async fn spawn(
+    self,
+    auth_key_public: Secp256k1PublicKey,   // from Noise authority keypair
+    auth_key_secret: Secp256k1SecretKey,   // fixes placeholder key audit finding
+) -> Result<(
+    JoinHandle<()>,
+    mpsc::Sender<SwarmCommand>,
+    mpsc::Sender<BraidpoolDBTypes>,
+    Arc<RwLock<Braid>>,
+    Arc<Mutex<SwarmHandler>>,              // new — needed for propagate_valid_bead
+), BraidpoolError>
+```
+
+Channel manager — `OpenExtendedMiningChannel` response:
+```rust
+// extranonce_size depends on mode
+let extranonce_size: u16 = match node_mode {
+    NodeMode::Normal => 12,
+    NodeMode::Audit => 5,
+};
+// extranonce_prefix = 4 bytes random (normal) or 11 bytes (audit)
+```
+
+**Test:** Noise handshake test — pool and mock tproxy complete NX-handshake, assert `SetupConnection.Success` with correct `extranonce_size`.
+
+---
+
+### PR 3 — Share→bead bridge in sv2-apps pool
+
+**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/share-bead-bridge`  
+**Reference:** Sansh's `pool/src/lib/channel_manager/mining_message_handler.rs`
 
 ```rust
+// pool-apps/pool/src/lib/mod.rs
 pub struct ValidatedShare {
-    pub extranonce1: Vec<u8>,   // 4 bytes normal, 11 bytes audit — NOT u64
-    pub extranonce2: Vec<u8>,   // variable
+    pub extranonce1: Vec<u8>,    // 4 bytes normal, 11 bytes audit — NOT u64
+    pub extranonce2: Vec<u8>,
     pub ntime: u32,
     pub nonce: u32,
     pub version: u32,
-    pub template_id: u64,       // post-#492; pre-#492 use TemplateId enum
+    pub template_id: u64,
     pub channel_id: u32,
+    pub bead_context: BeadContext,
 }
 
 pub type ShareBridgeSender = mpsc::Sender<ValidatedShare>;
 ```
 
-Job lookup (post-#492): `global_job_store.get(job_id)` → `(Arc<JobDetails>, TemplateId)`.
+PoW validation uses `SetTarget`'s U256 target directly:
+```rust
+// Do NOT use target_from_difficulty (f64 precision loss — audit finding 8)
+// Use the channel's maximum_target from SetTarget message
+let target = U256::from(channel.maximum_target);
+validate_pow_against_target(&header, target)?;
+```
 
-**PoW validation:** Use the channel's maximum target from `SetTarget` (a U256-compatible value) for
-PoW comparison. Do NOT use `target_from_difficulty` — that function uses f64 arithmetic which
-introduces precision loss at high difficulties. `SubmitSharesExtended` carries the target directly.
+Job lookup uses `GlobalJobStore` (post-#492):
+```rust
+// single lookup — (Arc<JobDetails>, TemplateId)
+let (job, template_id) = global_job_store
+    .get(job_id)
+    .ok_or(ShareError::JobNotFound(job_id))?;
+```
 
-**Test:** Mock a `SubmitSharesExtended` with known-valid PoW, assert `ShareBridgeSender` receives
-one `ValidatedShare` with correct fields, assert `SubmitSharesSuccess` is sent upstream.
+**Test:** Mock `SubmitSharesExtended` with valid PoW → assert `ShareBridgeSender` receives `ValidatedShare` with correct fields, assert `SubmitSharesSuccess` sent upstream.
 
-### PR 4 — Wire Pool Into Braidpool Node (braidpool/braidpool)
+---
 
-**Branch:** `feat/sv2-pool-wiring`  
-`node/src/main.rs`, new `node/src/sv2/mod.rs`
+### PR 4 — Wire pool into braidpool node
 
-#### NotifyCmd fanout — required change
+**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-pool-wiring`
 
-`notification_tx` is currently `mpsc::channel` (single consumer = SV1 Notifier). SV2 pool cannot
-tap it directly. Convert to broadcast:
-
+`notification_tx` fanout — converts single-consumer `mpsc` to broadcast:
 ```rust
 // main.rs
 let (notification_tx, _) = tokio::sync::broadcast::channel::<NotifyCmd>(1024);
-let sv1_rx = notification_tx.subscribe();  // → SV1 Notifier
-let sv2_rx = notification_tx.subscribe();  // → SV2 pool
-
-// NotifyCmd must impl Clone (check BlockTemplate derives Clone)
+let sv1_rx = notification_tx.subscribe();   // → existing SV1 Notifier
+let sv2_rx = notification_tx.subscribe();   // → new sv2_template_consumer task
+// NotifyCmd must derive Clone — check BlockTemplate fields
 ```
 
-Alternative if `NotifyCmd` can't derive `Clone`:
-
+Alternative if `NotifyCmd` can't derive `Clone` (large `Vec<Transaction>` inside):
 ```rust
-// fanout task
-let (notify_tx, notify_rx) = mpsc::channel::<NotifyCmd>(1024);
-let (sv1_tx, sv1_rx) = mpsc::channel(1024);
-let (sv2_tx, sv2_rx) = mpsc::channel(1024);
+// fanout task — avoids Clone derive requirement
 tokio::spawn(async move {
     while let Some(cmd) = notify_rx.recv().await {
         let _ = sv1_tx.send(cmd.clone()).await;
@@ -307,136 +388,105 @@ tokio::spawn(async move {
 });
 ```
 
-#### Placeholder key — must not be silently inherited
-
-Both `propagate_valid_bead` (lib.rs:322) and `validate_and_forward_upstream_share`
-(stratum.rs:1303) use a hardcoded placeholder public key:
+`BraidpoolTemplate` conversion in `ipc_template_consumer`:
 ```rust
-let public_key = "020202020202020202020202020202020202020202020202020202020202020202"
-    .parse::<bitcoin::PublicKey>().unwrap();
+// node/src/lib.rs — after building BlockTemplate
+let braidpool_template = BraidpoolTemplate::from_block_template(
+    &processed_template,
+    &components,
+    template_id,
+)?;
+braidpool_template_tx.send(braidpool_template).await?;
 ```
 
-PR 4 must add explicit `// FIXME(sv2-integration): replace with authority_key from Noise keypair`
-comments at both sites and file a tracking issue. Do not silently inherit the placeholder into the
-SV2 path.
-
-#### CLI additions
-
+CLI additions:
 ```
---sv2-pool-port  <PORT>   Port for SV2 pool (default 34254, 0 to disable)
---sv2-authority-pubkey    Pool authority public key (hex)
---sv2-authority-seckey    Pool authority secret key (hex)
+--sv2-pool-port <PORT>        SV2 pool listen port (default 34254, 0 = disabled)
+--sv2-authority-pubkey <HEX>  Pool authority public key
+--sv2-authority-seckey <HEX>  Pool authority secret key
 ```
 
-#### Network config
+Placeholder key fix — at `lib.rs:322` and `stratum.rs:1303`:
+```rust
+// FIXME(sv2-integration): replace with authority_key from Noise keypair
+// tracked in issue #XXX
+let public_key = "020202...".parse::<bitcoin::PublicKey>().unwrap();
+```
 
-Use `bitcoin::Network` directly. **`PoolNetwork` enum does not exist** in the codebase — do not
-reference it.
+SV1 stratum service runs unchanged in parallel. SV2 is additive.
 
-The existing SV1 stratum service runs unchanged in parallel. SV2 is additive.
+**Test:** Integration test — node starts, mock tproxy connects, `NotifyCmd::SendToAll` sent, `NewExtendedMiningJob` arrives at mock tproxy socket.
 
-**Test:** Integration test that starts a node in test mode, connects a mock tproxy, completes the
-Noise handshake, sends a `NotifyCmd::SendToAll`, and asserts a `NewExtendedMiningJob` arrives at
-the mock tproxy socket.
+---
 
-### PR 5 — Translator Binary (braidpool/braidpool)
+### PR 5 — Translator binary
 
-**Branch:** `feat/sv2-translator-wiring`  
- new `translator/` binary crate at workspace root
+**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-translator-binary`
 
-Introduces a standalone binary that runs alongside the node:
+New binary crate at workspace root. Uses `miner-apps/translator` from `braidpool/sv2-apps` fork as the core. Braidpool-specific additions: extranonce subdivision using 4-byte prefix (normal mode), `mining.notify` construction using merkle root computed from `BraidpoolTemplate.merkle_path`.
 
-- Connects upstream to Braidpool pool via SV2 Noise channel (PR 2)
-- Accepts SV1 miners downstream on port 3333 (configurable)
-- Translates `NewExtendedMiningJob` → per-miner `mining.notify`
-- Translates `mining.submit` → `SubmitSharesExtended` upstream
-
-Config file `translator.toml`:
+Config `translator.toml`:
 ```toml
 [upstream]
 pool_address = "127.0.0.1:34254"
-authority_pubkey = "..."   # must match pool's keypair
+authority_pubkey = "..."  # must match pool's keypair
 
 [downstream]
 listen_address = "0.0.0.0:3333"
 min_extranonce2_size = 6
 ```
 
-**Test:** Full end-to-end: pool node + translator + mock SV1 miner. Mock miner sends
-`mining.subscribe`, `mining.authorize`, receives `mining.notify`, sends `mining.submit`. Assert
-`SubmitSharesSuccess` arrives at mock miner and `ValidatedShare` arrives at `ShareBridgeSender`.
+**Test:** End-to-end — pool + translator + mock SV1 miner. Full `subscribe → authorize → notify → submit → success` cycle.
 
 ---
 
-## 8. PR Ordering and Dependencies
+## 9. PR Ordering
 
 ```
-#492 (GlobalJobStore) — merge first, unblocks clean job lookup in PR 3
-#503 (share counters) — merge after #492
-         ↓
-PR 1 (template adapter — separator scan, BraidpoolTemplate with height)
-         ↓
-PR 2 (noise channel manager — correct extranonce sizes per mode)
-         ↓
-PR 3 (share bridge — Vec<u8> extranonces, target from SetTarget, GlobalJobStore lookup)
-         ↓  (PRs 1-3 target braidpool/sv2-apps)
-PR 4 (node wiring — broadcast fanout, bitcoin::Network, FIXME placeholder keys)
-         ↓
-PR 5 (translator binary)
+PR 0 (BraidpoolTemplate in braidpool-common) — targets braidpool/braidpool
+    ↓
+PR 1 (template provider) — targets braidpool/sv2-apps
+    ↓
+PR 2 (noise channel manager) — targets braidpool/sv2-apps
+    ↓
+PR 3 (share bridge) — targets braidpool/sv2-apps
+    ↓  (PRs 0-3 merged)
+PR 4 (node wiring) — targets braidpool/braidpool
+    ↓
+PR 5 (translator binary) — targets braidpool/braidpool
 ```
 
-PRs 1–3 target `braidpool/sv2-apps`. PRs 4–5 target `braidpool/braidpool`. PR 4 can start
-structurally in parallel with PR 3 since it only depends on the interface types, not the
-implementation — but #492 must land before either.
+Also required before PR 4: #492, #503, #528, #530 merged to `braidpool:dev`.
 
 ---
 
-## 9. Dependency Versions — Verify First
-
-Before any code:
+## 10. Dependency Versions — Verify First
 
 ```bash
 # In sv2-apps
-grep -r "bitcoin" pool-apps/pool/Cargo.toml
-cat rust-toolchain.toml   # MSRV 1.85.0
+cat rust-toolchain.toml          # MSRV 1.85.0
+grep "bitcoin" pool-apps/pool/Cargo.toml
 
-# In braidpool node
+# In braidpool node (after #398)
 grep "bitcoin" node/Cargo.toml
 cargo build -p node 2>&1 | head -20
 ```
 
-sv2-apps specifies MSRV 1.85.0. Braidpool uses a forked `bitcoin` crate with the `CPUNet` network
-variant. Verify the forked crate's version is compatible before touching any logic. Resolve any
-conflict in a standalone dependency-only commit before the first PR.
+Resolve any version conflict in a standalone commit before PR 1.
 
 ---
 
-## 10. SV2 Spec Sections That Matter
+## 11. Audit Findings — Status After Sansh's Reference
 
-| Section | Topic |
-|---------|-------|
-| §4 | Noise protocol handshake |
-| §5.1.2 | Extended Job and Extended Extranonce (extranonce subdivision model) |
-| §5.1.3 | Future Job (latency win, requires `height` field) |
-| §5.3.15/5.3.16 | `NewMiningJob` and `NewExtendedMiningJob` message fields |
-| §5.3.17 | `SetNewPrevHash` |
-| §5.3.11/5.3.12 | `SubmitSharesStandard` and `SubmitSharesExtended` |
-
----
-
-## 11. Audit Findings Summary
-
-| # | Finding | Impact | Location |
-|---|---------|--------|----------|
-| 1 | Coinbase split uses separator scan, not byte offset | Wrong split point → invalid coinbase | stratum.rs:2236 |
-| 2 | OP_RETURN is in coinbase_tx_suffix, not prefix | Wrong field mapping | template_creator.rs:424 |
-| 3 | Actual extranonce1 is 4 bytes, not 8 | Wrong extranonce_prefix size in SV2 channel | stratum.rs:38 |
-| 4 | Audit-mode extranonce1 is 11 bytes — doesn't fit u64 | Data truncation in ValidatedShare | audit.rs:18-23 |
-| 5 | notification_tx is mpsc single-consumer | SV2 pool cannot subscribe to it | main.rs:155 |
-| 6 | PoolNetwork enum does not exist | Compile failure in PR 4 | config.rs |
-| 7 | BlockTemplate.height = Zero in ipc_template_consumer | Future Job broken | lib.rs:211-218 |
-| 8 | target_from_difficulty uses f64 precision loss | Incorrect PoW comparison | stratum.rs:1446 |
-| 9 | MiningJobMap is per-peer pre-#492 | Complex two-level lookup in share bridge | main.rs:234 |
-| 10 | Placeholder pubkey/sig hardcoded in two places | Security placeholder silently inherited | lib.rs:322, stratum.rs:1303 |
-
-
+| # | Finding | Status |
+|---|---------|--------|
+| 1 | Separator scan vs offset | Resolved — use `processed_block_hex` deserialization |
+| 2 | OP_RETURN in suffix | Confirmed correct — outputs are in `coinbase_tx_suffix` |
+| 3 | extranonce1 = 4 bytes | Confirmed — `UPSTREAM_EXTRANONCE1_SIZE = 4` |
+| 4 | Audit extranonce 11 bytes | Handled — `ValidatedShare.extranonce1: Vec<u8>` |
+| 5 | mpsc single consumer | Fix in PR 4 — broadcast fanout |
+| 6 | PoolNetwork doesn't exist | Use `bitcoin::Network` directly |
+| 7 | height = Zero | Fixed — `BraidpoolTemplate.height` from `ipc_template.components` |
+| 8 | f64 precision in PoW | Fixed in PR 3 — use U256 target from SetTarget |
+| 9 | Per-peer job map | Fixed — write against post-#492 `GlobalJobStore` |
+| 10 | Placeholder pubkey | Fixed — Sansh's auth key flows into `SwarmHandler::new` in PR 2 |
