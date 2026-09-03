@@ -2,7 +2,7 @@
 
 ## Reference Links
 
-- **Sansh's reference branch**: https://github.com/braidpool/braidpool/tree/sv2-integration-braidpool
+- **reference branch**: https://github.com/braidpool/braidpool/tree/sv2-integration-braidpool
 - **SV2 apps fork**: https://github.com/braidpool/sv2-apps
 
 ---
@@ -36,8 +36,6 @@ The current stratum layer is hand-rolled SV1 TCP in `node/src/stratum.rs`. Three
 
 ## 3. Repository Architecture Decision
 
-Two separate forks, as Sansh confirmed:
-
 ```
 braidpool/sv2-apps   ← SV2 protocol layer (pool, translator, template provider)
 braidpool/braidpool  ← Node wiring, bead bridge, main.rs changes
@@ -45,18 +43,18 @@ braidpool/braidpool  ← Node wiring, bead bridge, main.rs changes
 
 `braidpool-common` is the shared type boundary between the two repos. It currently exports `PoolNetwork` and `Cpunet`. It needs to also export or re-export the types that sv2-apps needs from the node — specifically anything the template provider consumes.
 
-**Why split repos:**
+**pros: Why split repos:**
 - SRI upstream changes can be absorbed in sv2-apps without touching braidpool node
 - SV2 protocol reviewers can review sv2-apps independently
 - Braidpool node PRs stay small — only wiring, not SV2 implementation
 
-**Maintenance cost:** When `braidpool-common` types change, sv2-apps dependency must be updated. When `NotifyCmd` or `BlockTemplate` fields change in node, sv2-apps pool crate may need updating.
+**cons:** When `braidpool-common` types change, sv2-apps dependency must be updated. When `NotifyCmd` or `BlockTemplate` fields change in node, sv2-apps pool crate may need updating.
 
 ---
 
-## 4. Key Finding from Sansh's Branch
+## 4. Key Finding from sv2-integration-braidpool
 
-Sansh's `sv2-integration-braidpool` branch (commits from `171a9a4` onwards) contains the reference implementation. His architecture reveals three critical design decisions that supersede our earlier analysis:
+ `sv2-integration-braidpool` branch contains the reference implementation. His architecture reveals three critical design decisions that supersede our earlier analysis:
 
 ### 4.1 Coinbase source — `processed_block_hex`, not separator scan
 
