@@ -9,7 +9,7 @@
 
 ## 1. Problem and Motivation
 
-Bitcoin mining is 80%+ centralized. Braidpool solves this with a DAG-based weak block protocol where every valid share becomes a bead in a directed acyclic graph, consensus is established by graph structure, and payouts are enforced by FROST threshold signatures with no trusted operator.
+Bitcoin mining is 80%+ centralized. Braidpool solves this with a DAG-based weak block protocol where every valid share becomes a bead in a directed acyclic graph, consensus is established by graph structure, and payouts are enforced on-chain with no trusted operator.
 
 The current stratum layer is hand-rolled SV1 TCP in `node/src/stratum.rs`. Three production blockers:
 - No authentication between pool components — MITM can inject fake jobs
@@ -155,40 +155,59 @@ let (swarm_handler, swarm_command_receiver) = SwarmHandler::new(
 Three options:
 
 - **Option A** — move `BlockTemplate` to `braidpool-common`. The template type becomes a shared type, both node and sv2-apps import it from there. Clean but requires a prerequisite PR.
-- **Option B** — sv2-apps takes node as a git dependency. Sansh's branch already does this (`use node::ipc::BlockTemplate`). Creates coupling but avoids restructuring.
+- **Option B** — sv2-apps takes node as a git dependency. Sansh's branch already does this (`use node::ipc::BlockTemplate`). Creates tight coupling and a messy dependency graph — not recommended.
 - **Option C** — define a minimal `BraidpoolTemplate` struct in `braidpool-common` that carries only what sv2-apps needs: `coinbase_tx_prefix`, `coinbase_tx_suffix`, `merkle_path`, `prev_hash`, `nbits`, `version`, `height`. Node converts `BlockTemplate → BraidpoolTemplate` before sending over the channel.
 
-**Recommended: Option C.** It keeps the dependency boundary clean, `braidpool-common` is already the shared crate, and `BraidpoolTemplate` is small enough to define without restructuring node. This is PR 0 — a prerequisite that unblocks everything.
+**Priority: Options A and C.** Both keep the dependency boundary clean. Option C is the current PR 0 approach and unblocks everything. Option A is a longer-term cleanup. Option B (git dependency) should not be pursued.
 
 ---
 
-## 7. Extranonce Layout (Confirmed Correct)
+## 7. Extranonce Layout
 
-From `node/src/stratum.rs:38`:
-```rust
-const UPSTREAM_EXTRANONCE1_SIZE: usize = 4; // actual extranonce1 sent to miners
+Braidpool supports two upstream pool configurations. The upstream pool negotiates extranonce sizes during `SetupConnection`; Braidpool adapts internally but always reconstructs the originally agreed format before submitting shares upstream.
+
+### Upstream configuration 1 — 4+8 (common)
+
+The upstream pool allocates 4 bytes for extranonce1 and 8 bytes for extranonce2.
+
+Braidpool internally uses:
+```
+extranonce1 (sent to miners) = upstream_ext1[4] + prefix[2] + commitment[5] = 11 bytes
+extranonce2 (miner-controlled)                                               =  1 byte
 ```
 
-From `node/src/lib.rs`:
+Before submitting a share upstream, Braidpool reconstructs:
+```
+reconstructed_extranonce1 = upstream_ext1[4]
+reconstructed_extranonce2 = prefix[2] + commitment[5] + rolling[1] = 8 bytes
+```
+
+### Upstream configuration 2 — 8+8
+
+The upstream pool allocates 8 bytes for extranonce1 and 8 bytes for extranonce2.
+
+Braidpool internally uses:
+```
+extranonce1 (sent to miners) = upstream_ext1[8] + prefix[2] + commitment[5] = 15 bytes
+extranonce2 (miner-controlled)                                               =  3 bytes
+```
+
+Before submitting a share upstream, Braidpool reconstructs:
+```
+reconstructed_extranonce1 = upstream_ext1[8]
+reconstructed_extranonce2 = prefix[2] + commitment[5] + rolling[3] = 8 bytes
+```
+
+### Why reconstruction is needed
+
+The upstream pool only accepts the extranonce format it originally agreed to (e.g. 4+8). Braidpool embeds the commitment bytes inside the extranonce space it sends to downstream miners, then strips them back out before forwarding the share upstream so the share validates correctly.
+
+### Constants (from `node/src/lib.rs`)
+
 ```rust
-pub const EXTRANONCE1_SIZE: usize = 8;      // half of separator size
+pub const EXTRANONCE1_SIZE: usize = 8;      // half of separator
 pub const EXTRANONCE2_SIZE: usize = 8;      // miner-controlled
 pub const EXTRANONCE_SEPARATOR: [u8; 16] = [1u8; 16];
-```
-
-**Normal mode Extended Channel:**
-```
-extranonce_prefix = 4 bytes  (pool-assigned, random per tproxy connection)
-extranonce        = 12 bytes (tproxy controls: 8 miner-rolls + 4 reserved)
-total             = 16 bytes (matches separator size)
-OpenExtendedMiningChannel.Success: extranonce_size = 12
-```
-
-**Audit mode:**
-```
-extranonce_prefix = 11 bytes (upstream_ext1[4] + miner_prefix[2] + commitment[5])
-extranonce        = 5 bytes
-OpenExtendedMiningChannel.Success: extranonce_size = 5
 ```
 
 ---
