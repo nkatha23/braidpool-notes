@@ -212,156 +212,52 @@ pub const EXTRANONCE_SEPARATOR: [u8; 16] = [1u8; 16];
 
 ---
 
-## 8. The PRs — Updated
+## 8. The PRs — Current State
 
-### PR 0 — Add `BraidpoolTemplate` to `braidpool-common`
+### sv2-apps PR #1 — `braidpool-common` + `braidpool-template-provider` (combines original PR 0 + PR 1)
 
-**Target:** `braidpool/braidpool`  **Branch:** `feat/braidpool-common-template-type`
+**GitHub:** `braidpool/sv2-apps#1`  **Branch:** `braidpool/template-provider`  **Status:** Open
 
+`braidpool-common` and `braidpool-template-provider` were merged into a single PR since both are prerequisites with no reviewable split. `braidpool-common` defines `BraidpoolTemplate` (the shared type boundary); `braidpool-template-provider` consumes it and produces SV2 `TemplateDistribution` messages.
+
+Key types in `pool-apps/braidpool-common/src/template.rs`:
 ```rust
-// braidpool-common/src/lib.rs
-pub mod template;
-
-// braidpool-common/src/template.rs
-#[derive(Debug, Clone)]
 pub struct BraidpoolTemplate {
-    pub coinbase_tx_prefix: Vec<u8>,   // bytes before EXTRANONCE_SEPARATOR
-    pub coinbase_tx_suffix: Vec<u8>,   // bytes after EXTRANONCE_SEPARATOR (all outputs)
+    pub coinbase_tx: Vec<u8>,        // full serialized coinbase from template_creator
     pub merkle_path: Vec<[u8; 32]>,
     pub prev_hash: [u8; 32],
     pub nbits: u32,
     pub version: i32,
-    pub height: u32,                   // from ipc_template.components — required for Future Job
+    pub height: u32,
     pub template_id: u64,
-    pub coinbase_tx: Vec<u8>,          // full serialized coinbase — for build_new_template
+    pub header_timestamp: u32,
 }
 ```
 
-Node's `ipc_template_consumer` converts `Arc<BlockTemplate> → BraidpoolTemplate` using `processed_block_hex` as the coinbase source. This gets sent over the notification channel alongside `NotifyCmd`.
-
-**Test:** Round-trip — build a `BraidpoolTemplate` from a known `BlockTemplate`, verify prefix+suffix reconstruct correctly when rejoined at the separator boundary.
-
----
-
-### PR 1 — `braidpool-template-provider` crate in sv2-apps
-
-**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/pool-template-adapter`  
-**Reference:** Sansh's `c6fddf8`, `203e935`, `f502db7`, `6c85bda`
-
-New crate at `stratum-apps/braidpool-template-provider/`:
-
-```toml
-# Cargo.toml
-[dependencies]
-braidpool-common = { git = "https://github.com/braidpool/braidpool", branch = "dev" }
-mining_sv2 = "10"
-template_distribution_sv2 = "3"
-binary_sv2 = "5"
-tokio = { workspace = true }
-tracing = { workspace = true }
-```
-
-Key function — `sv2_template_consumer`:
+Key function in `pool-apps/braidpool-template-provider/src/sv2_messages.rs`:
 ```rust
-pub async fn sv2_template_consumer(
-    mut template_rx: mpsc::Receiver<BraidpoolTemplate>,  // from braidpool-common, not node
-    sv2_outgoing_tx: Sender<TemplateDistribution<'static>>,
-    sv2_incoming_rx: Receiver<TemplateDistribution<'static>>,
-    cancellation_token: CancellationToken,
-) -> Result<(), BraidpoolTemplateProviderError>
-```
-
-Key function — `build_new_template`:
-```rust
-pub fn build_new_template<'a>(
+pub fn build_new_template(
     template: &BraidpoolTemplate,
     future_template: bool,
-) -> Result<NewTemplate<'a>, TemplateDataError> {
-    // Use template.coinbase_tx directly (already built by template_creator)
-    // braidpool_mode = true: include ALL outputs in coinbase_tx_outputs
-    // This carries reward + segwit + OP_RETURN commitment through to factory.rs
-}
+) -> Result<NewTemplateOwned, TemplateDataError>
+// braidpool_mode=true: ALL outputs included (reward + segwit + OP_RETURN)
 ```
 
-Key function — `build_new_template_from_block_template` (kept for compatibility):
-```rust
-// Uses BraidpoolTemplate.coinbase_tx (serialized full coinbase)
-// instead of processed_block_hex deserialization
-// Eliminates the fallback chain Sansh needed
-```
-
-**Test:** Unit test — `BraidpoolTemplate` with known coinbase produces `NewTemplate` with correct `coinbase_tx_outputs` count (3: reward + segwit + OP_RETURN).
+Copilot findings (all fixed in commits `9f564f7`, `c5b29a6`):
+- `header_timestamp=0` → added `header_timestamp` field to `BraidpoolTemplate`
+- empty coinbase inputs guard added
+- closed channel handled in `select!` loops
+- unit tests added for `build_new_template` and `build_set_new_prev_hash`
 
 ---
 
-### PR 2 — Noise channel manager in sv2-apps pool
+### sv2-apps PR #2 — Share bridge + `ValidatedShare` (combines original PR 2 + PR 3)
 
-**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/noise-channel-manager`  
-**Reference:** Sansh's `20fd115`, `9e3473d`
+**GitHub:** `braidpool/sv2-apps#2`  **Branch:** `braidpool/noise-channel-manager`  **Status:** Open
 
-Adapts `pool-apps/pool/` to accept `BraidpoolTemplate` instead of TDP templates.
+All share bridge work is in one PR. Original PR 2 (ChannelManager wiring) and PR 3 (channel_id + template_id fixes) were consolidated onto the same branch — no reviewable reason to split them.
 
-Key struct addition — `BeadContext`:
-```rust
-// pool-apps/pool/src/lib/braidpool/mod.rs
-pub struct BeadContext {
-    pub template_id: u64,
-    pub template_propagation_time: std::time::Instant,
-    pub transactions: Vec<bitcoin::Transaction>,  // for CommittedMetadata
-}
-```
-
-Key change — `BraidpoolP2P::spawn` signature:
-```rust
-pub async fn spawn(
-    self,
-    auth_key_public: Secp256k1PublicKey,   // from Noise authority keypair
-    auth_key_secret: Secp256k1SecretKey,   // fixes placeholder key audit finding
-) -> Result<(
-    JoinHandle<()>,
-    mpsc::Sender<SwarmCommand>,
-    mpsc::Sender<BraidpoolDBTypes>,
-    Arc<RwLock<Braid>>,
-    Arc<Mutex<SwarmHandler>>,              // new — needed for propagate_valid_bead
-), BraidpoolError>
-```
-
-Channel manager — `OpenExtendedMiningChannel` response:
-```rust
-// extranonce_size depends on mode
-let extranonce_size: u16 = match node_mode {
-    NodeMode::Normal => 12,
-    NodeMode::Audit => 5,
-};
-// extranonce_prefix = 4 bytes random (normal) or 11 bytes (audit)
-```
-
-**Test:** Noise handshake test — pool and mock tproxy complete NX-handshake, assert `SetupConnection.Success` with correct `extranonce_size`.
-
----
-
-### PR 3 — Add `channel_id` to `ValidatedShare` and fix template_id gap
-
-**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/share-bridge`
-
-PR 2 already landed the share bridge wiring. PR 3 fills the remaining gaps:
-
-1. **`channel_id: u32`** added to `ValidatedShare` — the node needs this to correlate shares back to the originating SV2 channel/miner.
-
-2. **`template_id` for `Valid` shares** — previously `None` because `ShareValidationResult::Valid` doesn't carry it. Fixed by reading `extended_channel.get_active_job()` after validation:
-```rust
-let template_id = extended_channel
-    .get_active_job()
-    .and_then(|job| match job.get_origin() {
-        JobOrigin::NewTemplate(t) => Some(t.template_id),
-        _ => None,
-    });
-```
-Note: `GlobalJobStore` does NOT apply here — that is braidpool's `stratum.rs`. Template lookup in sv2-apps uses SRI's `ExtendedChannel::get_active_job()`.
-
-`bead_context: BeadContext` is deferred to PR 4 — it requires template metadata the node holds, not the pool.
-
-**Final `ValidatedShare`:**
+New module `pool-apps/pool/src/lib/braidpool/mod.rs`:
 ```rust
 pub struct ValidatedShare {
     pub template_id: Option<u64>,  // None only for custom-job shares
@@ -372,11 +268,22 @@ pub struct ValidatedShare {
     pub ntime: u32,
     pub nonce: u32,
 }
+
+pub struct BeadContext { ... }          // deferred to PR 4 (node wiring)
+pub enum ExtraNonceConfig { ... }       // Normal / Audit mode extranonce sizing
+pub type ShareBridgeSender = mpsc::UnboundedSender<ValidatedShare>;
+pub type ShareBridgeReceiver = mpsc::UnboundedReceiver<ValidatedShare>;
+pub fn create_share_bridge() -> (ShareBridgeSender, ShareBridgeReceiver)
 ```
+
+Key decisions:
+- `template_id` for `Valid` shares: read from `extended_channel.get_active_job()` → `JobOrigin::NewTemplate(t)` → `t.template_id`. **Not** from braidpool's `GlobalJobStore` — that lives in `stratum.rs` and is unrelated to sv2-apps.
+- `ShareBridgeReceiver` kept alive in `PoolRuntime` until PR 4 wires it to `propagate_valid_bead`.
+- `UnboundedSender::send()` is non-async — safe to call inside SRI's sync closures without blocking.
 
 ---
 
-### PR 4 — Wire pool into braidpool node
+### braidpool PR 4 — Wire pool into braidpool node
 
 **Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-pool-wiring`
 
@@ -455,17 +362,13 @@ min_extranonce2_size = 6
 ## 9. PR Ordering
 
 ```
-PR 0 (BraidpoolTemplate in braidpool-common) — targets braidpool/braidpool
+sv2-apps PR #1 (braidpool-common + template-provider)  — branch: braidpool/template-provider
     ↓
-PR 1 (template provider) — targets braidpool/sv2-apps
+sv2-apps PR #2 (share bridge + ValidatedShare)         — branch: braidpool/noise-channel-manager
+    ↓  (both sv2-apps PRs merged)
+braidpool PR 4 (node wiring)                           — branch: feat/sv2-pool-wiring
     ↓
-PR 2 (noise channel manager) — targets braidpool/sv2-apps
-    ↓
-PR 3 (share bridge) — targets braidpool/sv2-apps
-    ↓  (PRs 0-3 merged)
-PR 4 (node wiring) — targets braidpool/braidpool
-    ↓
-PR 5 (translator binary) — targets braidpool/braidpool
+braidpool PR 5 (translator binary)                     — branch: feat/sv2-translator-binary
 ```
 
 Also required before PR 4: #492, #503, #528, #530 merged to `braidpool:dev`.
