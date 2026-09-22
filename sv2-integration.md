@@ -340,44 +340,39 @@ let extranonce_size: u16 = match node_mode {
 
 ---
 
-### PR 3 — Share→bead bridge in sv2-apps pool
+### PR 3 — Add `channel_id` to `ValidatedShare` and fix template_id gap
 
-**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/share-bead-bridge`  
-**Reference:** Sansh's `pool/src/lib/channel_manager/mining_message_handler.rs`
+**Target:** `nkatha23/sv2-apps → braidpool/sv2-apps`  **Branch:** `braidpool/share-bridge`
 
+PR 2 already landed the share bridge wiring. PR 3 fills the remaining gaps:
+
+1. **`channel_id: u32`** added to `ValidatedShare` — the node needs this to correlate shares back to the originating SV2 channel/miner.
+
+2. **`template_id` for `Valid` shares** — previously `None` because `ShareValidationResult::Valid` doesn't carry it. Fixed by reading `extended_channel.get_active_job()` after validation:
 ```rust
-// pool-apps/pool/src/lib/mod.rs
+let template_id = extended_channel
+    .get_active_job()
+    .and_then(|job| match job.get_origin() {
+        JobOrigin::NewTemplate(t) => Some(t.template_id),
+        _ => None,
+    });
+```
+Note: `GlobalJobStore` does NOT apply here — that is braidpool's `stratum.rs`. Template lookup in sv2-apps uses SRI's `ExtendedChannel::get_active_job()`.
+
+`bead_context: BeadContext` is deferred to PR 4 — it requires template metadata the node holds, not the pool.
+
+**Final `ValidatedShare`:**
+```rust
 pub struct ValidatedShare {
-    pub extranonce1: Vec<u8>,    // 4 bytes normal, 11 bytes audit — NOT u64
+    pub template_id: Option<u64>,  // None only for custom-job shares
+    pub channel_id: u32,
+    pub extranonce1: Vec<u8>,
     pub extranonce2: Vec<u8>,
+    pub version: u32,
     pub ntime: u32,
     pub nonce: u32,
-    pub version: u32,
-    pub template_id: u64,
-    pub channel_id: u32,
-    pub bead_context: BeadContext,
 }
-
-pub type ShareBridgeSender = mpsc::Sender<ValidatedShare>;
 ```
-
-PoW validation uses `SetTarget`'s U256 target directly:
-```rust
-// Do NOT use target_from_difficulty (f64 precision loss — audit finding 8)
-// Use the channel's maximum_target from SetTarget message
-let target = U256::from(channel.maximum_target);
-validate_pow_against_target(&header, target)?;
-```
-
-Job lookup uses `GlobalJobStore` (post-#492):
-```rust
-// single lookup — (Arc<JobDetails>, TemplateId)
-let (job, template_id) = global_job_store
-    .get(job_id)
-    .ok_or(ShareError::JobNotFound(job_id))?;
-```
-
-**Test:** Mock `SubmitSharesExtended` with valid PoW → assert `ShareBridgeSender` receives `ValidatedShare` with correct fields, assert `SubmitSharesSuccess` sent upstream.
 
 ---
 
