@@ -199,49 +199,58 @@ without implementing the real consumer yet.
 
 ---
 
-## 7. Remaining blockers before TCP/IP transport work
+## 7. What remains for stratum layer stability (actual implementation gaps)
 
-Zaid confirmed: resolve stratum layer first, then TCP/IP. Here's what's remaining:
+This is not a PR list — it's what needs to exist before the stratum layer is
+considered stable enough for real miners and before TCP/IP transport work starts.
 
-### Open stratum PRs (must merge first)
-| PR | Title | Status |
-|----|-------|--------|
-| #492 | GlobalJobStore | Open — needs rebase |
-| #503 | Per-miner share counters | Open |
-| #531 | Worker name / payout address parsing | Open — rfind issue |
-| #543 | Notify latency instrumentation | Open |
-| #561 | BraidpoolTemplate / SV2 node wiring | Open |
+### Done (merged)
+- ✅ GlobalJobStore (#492) — OOM fix, Arc sharing, single template allocation
+- ✅ Per-miner share counters (#503) — accepted/stale/invalid tracking
+- ✅ Slow miner backpressure — try_send + clean_jobs + disconnect after N failures
 
-### Major unimplemented features
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Difficulty adjustment | Not implemented | Sansh has rough impl on fork (Sansh2356/braidpool#28) — needs review |
-| ECDSA payout signing | Not implemented | Sansh fork has rough impl — needs review |
-| SV2 pool (sv2-apps PR #1, #2) | Open | Template provider + share bridge |
-| Braidpool node SV2 wiring (PR 4) | Open — `feat/sv2-pool-wiring` | Drain task placeholder |
-| Translator binary (PR 5) | Not started | Depends on PR 4 |
+### In flight (open PRs)
+- 🔄 Worker name / payout address parsing (#531) — rfind inconsistency needs fix
+- 🔄 Notify latency instrumentation (#543) — baseline measurement before any transport work
+- 🔄 BraidpoolTemplate / SV2 node wiring (#561) — drain task placeholder, needs sv2-apps wired
 
-### TCP/IP transport work — what it involves
+### Not started — stratum structural gaps
+| Gap | Description | Roadmap ref |
+|-----|-------------|-------------|
+| Connection limit | No cap on accepted TCP connections — unbounded file descriptors at scale | Month 2, Issue 3 |
+| ConnectionGuard | Cleanup only runs on normal return — panics leave ghost entries forever | Month 2, Issue 4 |
+| Coinbase size enforcement | No guard that total coinbase stays within Bitcoin consensus limit as committed metadata grows | Month 2, A2 |
+| Lazy transaction fetch | `Vec<Transaction>` stored in every JobDetails — only needed when miner finds full Bitcoin block | Month 2, A2b |
+| DashMap concurrency | Nested `Mutex<HashMap<Mutex<...>>>` pattern still present — deadlock risk under 10k concurrent submits | Month 1, Issue 2 |
+| Stratum load generator | No tool to simulate N miners — needed to validate all the above at scale | Month 3 |
 
-mstrr asked if you're doing the TCP/IP work. From the roadmap this means replacing
-libp2p's QUIC transport with TCP/IP for peer connections. Current state:
+### Not started — protocol / consensus gaps (block stratum AND TCP work)
+| Gap | Description |
+|-----|-------------|
+| Difficulty adjustment | Completely unimplemented. Sansh has a rough impl on `Sansh2356/braidpool#28` — needs review against spec |
+| ECDSA payout signing | Unimplemented. Sansh fork has rough impl — needs review. Connects to placeholder key issue |
+| DAG tip → notify wiring | `clean_jobs=true` should fire at cohort boundaries, not just Bitcoin block arrivals |
+| SV2 pool wiring (PR 4) | sv2-apps PRs 1 & 2 need to be wired into the node — drain task is a placeholder |
+| Translator binary (PR 5) | SV1↔SV2 translation layer — depends on PR 4 |
 
-- All peer connections use libp2p with QUIC (`/ip4/.../udp/.../quic-v1`)
-- `--addnode` flag takes multiaddr format (confirmed in PR #554 review)
-- TCP transport would use `/ip4/.../tcp/...` multiaddrs instead
+### TCP/IP transport work — when it unblocks
 
-**What overlaps with stratum work**: The notify path (#543) touches how templates
-propagate to miners. TCP transport touches how beads propagate to peers. These
-are different layers (stratum=miner-facing, libp2p=peer-facing) so they don't
-directly conflict. But stabilizing the notify path first is sensible because
-latency characteristics change with transport, and you want the instrumentation
-(#543) in place before measuring the improvement.
+From the roadmap, TCP/IP here means **UDP multicast for `mining.notify`** — not
+replacing libp2p peer transport. The problem: at 40,000 miners, O(N) TCP sends
+take 40ms per job broadcast, eating 27% of the 150ms bead window.
 
-**Suggested sequence before starting TCP/IP work**:
-1. Merge #492, #503, #531, #543 (stratum stability)
-2. Merge PR #561 + sv2-apps PRs 1 and 2 (SV2 foundation)
-3. Review Sansh's difficulty adjustment impl
-4. Then start TCP/IP transport changes
+**The notify latency instrumentation (#543) must land first** — you need the
+baseline measurement before you can claim the multicast implementation is better.
+
+**Minimum viable state before starting multicast work:**
+1. ✅ GlobalJobStore merged
+2. ✅ Share counters merged
+3. 🔄 Notify latency baseline (#543)
+4. ❌ Connection limit + ConnectionGuard
+5. ❌ Difficulty adjustment reviewed
+
+Items 4 and 5 don't block the multicast design but they block claiming the
+stratum layer is "stable." Zaid's framing was correct — get those in first.
 
 ---
 
