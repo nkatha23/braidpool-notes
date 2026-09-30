@@ -1,8 +1,4 @@
-# SV2 Strategy, Stratum Architecture, and Remaining Blockers
-
-Written 2026-09-30 based on Zaid/mstrr discussion and current codebase state.
-Covers: which SV2 repo to use, mixed SV1/SV2 miners, stratum.rs size, transaction
-selection, TCP/IP work, and remaining blockers before that work starts.
+# SV2 Strategy, Stratum Architecture, and Remaining Blockers.
 
 ---
 
@@ -254,7 +250,7 @@ stratum layer is "stable." Zaid's framing was correct — get those in first.
 
 ---
 
-## 8. Sansh's difficulty adjustment and ECDSA payout — what to check
+## 8.  difficulty adjustment and ECDSA payout — what to check
 
 Repo: `Sansh2356/braidpool` PR #28
 
