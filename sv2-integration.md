@@ -251,11 +251,30 @@ Copilot findings (all fixed in commits `9f564f7`, `c5b29a6`):
 
 ---
 
-### sv2-apps PR #2 — Share bridge + `ValidatedShare` (combines original PR 2 + PR 3)
+### sv2-apps PR #2 — Share bridge + `ValidatedShare` + `BraidpoolIpc` wiring
 
-**GitHub:** `braidpool/sv2-apps#2`  **Branch:** `braidpool/noise-channel-manager`  **Status:** Open
+**GitHub:** `braidpool/sv2-apps#2`  **Branch:** `braidpool/noise-channel-manager`  **Status:** Open  
+**Depends on:** sv2-apps PR #1 (must merge first — provides `braidpool-common` and `braidpool-template-provider`)
 
-All share bridge work is in one PR. Original PR 2 (ChannelManager wiring) and PR 3 (channel_id + template_id fixes) were consolidated onto the same branch — no reviewable reason to split them.
+This PR has 4 commits:
+1. `fe0bfdf1` — feat(pool): bridge validated shares from SV2 pool to Braidpool node
+2. `0ba82cd9` — fix(pool): populate template_id from active job in Valid share arm
+3. `e302ff22` — feat(pool): add channel_id to ValidatedShare
+4. `67b91dba` — feat(pool): wire BraidpoolIpc template provider and expose ShareBridgeReceiver ← **our addition**
+
+**Why it can't compile standalone:** commit 4 imports `braidpool_common::template::BraidpoolTemplate` and `braidpool_template_provider::sv2_template_consumer`, which only exist after PR #1 merges. This is expected for a stacked PR — the branch is correct, it just won't build without its prerequisite.
+
+**After PR #1 merges into `sv2-integration-braidpool`:**
+```bash
+git fetch upstream
+git rebase upstream/sv2-integration-braidpool
+git push --force-with-lease origin braidpool/noise-channel-manager
+```
+The duplicate cherry-picked commits will drop automatically; only the 4 commits above remain.
+
+---
+
+#### Original share bridge additions (commits 1–3)
 
 New module `pool-apps/pool/src/lib/braidpool/mod.rs`:
 ```rust
@@ -269,7 +288,7 @@ pub struct ValidatedShare {
     pub nonce: u32,
 }
 
-pub struct BeadContext { ... }          // deferred to PR 4 (node wiring)
+pub struct BeadContext { ... }          // deferred to node PR 5 wiring
 pub enum ExtraNonceConfig { ... }       // Normal / Audit mode extranonce sizing
 pub type ShareBridgeSender = mpsc::UnboundedSender<ValidatedShare>;
 pub type ShareBridgeReceiver = mpsc::UnboundedReceiver<ValidatedShare>;
@@ -278,69 +297,142 @@ pub fn create_share_bridge() -> (ShareBridgeSender, ShareBridgeReceiver)
 
 Key decisions:
 - `template_id` for `Valid` shares: read from `extended_channel.get_active_job()` → `JobOrigin::NewTemplate(t)` → `t.template_id`. **Not** from braidpool's `GlobalJobStore` — that lives in `stratum.rs` and is unrelated to sv2-apps.
-- `ShareBridgeReceiver` kept alive in `PoolRuntime` until PR 4 wires it to `propagate_valid_bead`.
+- `ShareBridgeReceiver` kept alive in `PoolRuntime` until node PR 5 wires it to `propagate_valid_bead`.
 - `UnboundedSender::send()` is non-async — safe to call inside SRI's sync closures without blocking.
 
 ---
 
-### braidpool PR 4 — Wire pool into braidpool node
+#### BraidpoolIpc wiring (commit 4)
 
-**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-pool-wiring`
+**Files changed:**
+- `stratum-apps/src/tp_type.rs` — new `BraidpoolIpc` variant (no config fields; channel wired at runtime)
+- `pool-apps/pool/src/lib/mod.rs` — `PoolSv2` additions
+- `pool-apps/pool/src/lib/pool_runtime.rs` — `PoolRuntime` threading + `bootstrap_template_provider` handler
+- `pool-apps/pool/src/main.rs` — update standalone binary call to `pool.start(None)`
+- `pool-apps/pool/Cargo.toml` — add `braidpool-common` and `braidpool-template-provider` deps
 
-`notification_tx` fanout — converts single-consumer `mpsc` to broadcast:
+**`PoolSv2` new API:**
 ```rust
-// main.rs
-let (notification_tx, _) = tokio::sync::broadcast::channel::<NotifyCmd>(1024);
-let sv1_rx = notification_tx.subscribe();   // → existing SV1 Notifier
-let sv2_rx = notification_tx.subscribe();   // → new sv2_template_consumer task
-// NotifyCmd must derive Clone — check BlockTemplate fields
+// Builder — call before start() when template_provider_type = BraidpoolIpc
+pub fn with_braidpool_template_rx(
+    self,
+    rx: tokio::sync::mpsc::Receiver<BraidpoolTemplate>,
+) -> Self
+
+// Updated start() — delivers ShareBridgeReceiver to caller before blocking on shutdown
+pub async fn start(
+    &self,
+    share_rx_notify: Option<tokio::sync::oneshot::Sender<ShareBridgeReceiver>>,
+) -> Result<(), PoolErrorKind>
 ```
 
-Alternative if `NotifyCmd` can't derive `Clone` (large `Vec<Transaction>` inside):
-```rust
-// fanout task — avoids Clone derive requirement
-tokio::spawn(async move {
-    while let Some(cmd) = notify_rx.recv().await {
-        let _ = sv1_tx.send(cmd.clone()).await;
-        let _ = sv2_tx.send(cmd).await;
-    }
-});
-```
+`braidpool_template_rx` is stored as `Arc<std::sync::Mutex<Option<Receiver>>>` on `PoolSv2` so the struct stays `Clone`. It is taken out once during `PoolRuntime::new()` and consumed in `bootstrap_template_provider`.
 
-`BraidpoolTemplate` conversion in `ipc_template_consumer`:
-```rust
-// node/src/lib.rs — after building BlockTemplate
-let braidpool_template = BraidpoolTemplate::from_block_template(
-    &processed_template,
-    &components,
-    template_id,
-)?;
-braidpool_template_tx.send(braidpool_template).await?;
-```
+`BraidpoolIpc` in `bootstrap_template_provider` spawns `sv2_template_consumer` as a managed task. It errors with `PoolErrorKind::Configuration` if `with_braidpool_template_rx()` was not called before `start()`. `BraidpoolIpc` is also blocked from using JDS (same as `Sv2Tp` — requires `BitcoinCoreIpc`).
 
-CLI additions:
+TOML config for `BraidpoolIpc`:
+```toml
+template_provider_type = "BraidpoolIpc"
+# No address or keys needed — channel is injected by the node at runtime
 ```
---sv2-pool-port <PORT>        SV2 pool listen port (default 34254, 0 = disabled)
---sv2-authority-pubkey <HEX>  Pool authority public key
---sv2-authority-seckey <HEX>  Pool authority secret key
-```
-
-Placeholder key fix — at `lib.rs:322` and `stratum.rs:1303`:
-```rust
-// FIXME(sv2-integration): replace with authority_key from Noise keypair
-// tracked in issue #XXX
-let public_key = "020202...".parse::<bitcoin::PublicKey>().unwrap();
-```
-
-SV1 stratum service runs unchanged in parallel. SV2 is additive.
-
-**Test:** Integration test — node starts, mock tproxy connects, `NotifyCmd::SendToAll` sent, `NewExtendedMiningJob` arrives at mock tproxy socket.
 
 ---
 
-### PR 5 — Translator binary
+### braidpool PR 4 — Wire node to produce BraidpoolTemplate for SV2 pool
 
-**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-translator-binary`
+**GitHub:** `braidpool/braidpool#561`  **Branch:** `feat/sv2-pool-wiring`  **Status:** Open (ready, `.expect()` fix applied)
+
+Adds `BraidpoolTemplate` production from `ipc_template_consumer` and the SV2 template channel in `main.rs`. Currently has a drain task placeholder where the real pool consumer will go.
+
+Key CLI args already added:
+```
+--sv2-pool-port <PORT>         SV2 pool listen port — enables SV2 mode when set
+--sv2-authority-pubkey <HEX>   Pool authority public key (Noise NX)
+--sv2-authority-seckey <HEX>   Pool authority secret key
+```
+
+`BraidpoolTemplate` channel wiring in `main.rs` (current state — drain task):
+```rust
+let sv2_template_tx = args.sv2_pool_port.map(|port| {
+    let (tx, rx) = mpsc::channel::<BraidpoolTemplate>(32);
+    // TODO(sv2-integration/PR5): replace this drain task with the real sv2-apps pool consumer
+    tokio::spawn(async move { while let Some(_) = rx.recv().await {} });
+    tx
+});
+```
+
+SV1 stratum service runs unchanged in parallel. SV2 is purely additive.
+
+---
+
+### braidpool PR 5 — Replace drain task with real sv2-apps pool consumer
+
+**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-pool-consumer` (not yet created)  
+**Depends on:** sv2-apps PR #2 merged (needs `BraidpoolIpc`, `PoolSv2::with_braidpool_template_rx`, `ShareBridgeReceiver`)  
+**Depends on:** braidpool PR 4 merged (needs the drain task and `sv2_template_tx` to exist)
+
+**`node/Cargo.toml`** additions:
+```toml
+pool_sv2 = { git = "https://github.com/braidpool/sv2-apps", branch = "sv2-integration-braidpool" }
+
+# Tell Cargo to use our local braidpool-common when pool_sv2 also needs it
+# (avoids duplicate crate in the dep graph)
+[patch."https://github.com/braidpool/sv2-apps"]
+braidpool-common = { path = "./braidpool-common" }
+```
+
+**`node/src/cli.rs`** additions:
+```rust
+/// Bitcoin address for the pool's coinbase payout output. Required when --sv2-pool-port is set.
+#[arg(long)]
+pub sv2_pool_coinbase_addr: Option<String>,
+```
+
+**`node/src/main.rs`** — replace drain task:
+```rust
+let sv2_template_tx = args.sv2_pool_port.map(|port| {
+    let (tx, rx) = mpsc::channel::<BraidpoolTemplate>(32);
+
+    let pool_config = build_sv2_pool_config(&args, port);  // helper to build PoolConfig from CLI args
+    let pool = PoolSv2::new(pool_config).with_braidpool_template_rx(rx);
+
+    let (share_rx_tx, share_rx_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Err(e) = pool.start(Some(share_rx_tx)).await {
+            error!("SV2 pool exited with error: {e}");
+        }
+    });
+
+    tokio::spawn(async move {
+        match share_rx_rx.await {
+            Ok(mut share_receiver) => {
+                while let Some(share) = share_receiver.recv().await {
+                    // TODO: propagate_valid_bead(share) — wires into bead DAG
+                    info!(
+                        template_id = ?share.template_id,
+                        channel_id = share.channel_id,
+                        "ValidatedShare received from SV2 pool"
+                    );
+                }
+            }
+            Err(_) => warn!("SV2 pool shut down before share bridge was ready"),
+        }
+    });
+
+    info!(port = port, "SV2 pool started in BraidpoolIpc mode");
+    tx
+});
+```
+
+`propagate_valid_bead` wiring is deferred to PR 6 — this PR gets the channel running and logs shares.
+
+---
+
+### braidpool PR 6 — Translator binary
+
+**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-translator-binary`  
+**Depends on:** PR 5 merged
 
 New binary crate at workspace root. Uses `miner-apps/translator` from `braidpool/sv2-apps` fork as the core. Braidpool-specific additions: extranonce subdivision using 4-byte prefix (normal mode), `mining.notify` construction using merkle root computed from `BraidpoolTemplate.merkle_path`.
 
@@ -362,16 +454,27 @@ min_extranonce2_size = 6
 ## 9. PR Ordering
 
 ```
-sv2-apps PR #1 (braidpool-common + template-provider)  — branch: braidpool/template-provider
+sv2-apps PR #1 (braidpool-common + braidpool-template-provider)
+    branch: braidpool/template-provider
+    ↓ must merge first — PR #2 imports from these crates
+sv2-apps PR #2 (share bridge + ValidatedShare + BraidpoolIpc wiring)
+    branch: braidpool/noise-channel-manager
+    ↓ after PR #1 merges: git fetch && git rebase upstream/sv2-integration-braidpool
+    ↓ cherry-picked commits will drop; only 4 commits remain
+    ↓ (both sv2-apps PRs merged into sv2-integration-braidpool)
+braidpool PR 4 (node produces BraidpoolTemplate, drain task)
+    branch: feat/sv2-pool-wiring (#561) — ready, pending merge
     ↓
-sv2-apps PR #2 (share bridge + ValidatedShare)         — branch: braidpool/noise-channel-manager
-    ↓  (both sv2-apps PRs merged)
-braidpool PR 4 (node wiring)                           — branch: feat/sv2-pool-wiring
+braidpool PR 5 (replace drain task with real PoolSv2 consumer)
+    branch: feat/sv2-pool-consumer — not yet created
     ↓
-braidpool PR 5 (translator binary)                     — branch: feat/sv2-translator-binary
+braidpool PR 6 (translator binary)
+    branch: feat/sv2-translator-binary
 ```
 
-Also required before PR 4: #492, #503, #528, #530 merged to `braidpool:dev`.
+**Also required before braidpool PR 4:** #492, #503 merged to `braidpool:dev` (both done as of 2026-10-13).
+
+**Key interdependency note:** sv2-apps PR #2 imports `BraidpoolTemplate` from `braidpool-common` (PR #1) and calls `sv2_template_consumer` from `braidpool-template-provider` (PR #1). It will not compile without PR #1. The cherry-pick on `noise-channel-manager` was undone — after PR #1 merges, rebase PR #2 onto `sv2-integration-braidpool` to get a clean self-contained branch.
 
 ---
 
