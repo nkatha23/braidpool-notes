@@ -494,7 +494,76 @@ Resolve any version conflict in a standalone commit before PR 1.
 
 ---
 
-## 11. Audit Findings — Status After Sansh's Reference
+## 11. Upstream Blocker — `bitcoin_core_sv2` Compile Error on `sv2-integration-braidpool`
+
+### Summary
+
+Adding `pool_sv2` as a git dep in `node/Cargo.toml` (PR #595) causes CI to fail
+because `bitcoin_core_sv2` — a transitive dependency inside the
+`sv2-integration-braidpool` branch of `braidpool/sv2-apps` — does not compile
+against the current version of `stratum_core`.
+
+### Failing crate
+
+`bitcoin_core_sv2 v0.5.0` at commit `9d49b984` on `sv2-integration-braidpool`.
+
+### Errors (10 total, two files affected)
+
+**File**: `bitcoin-core-sv2/src/unix_capnp/v30x/template_distribution_protocol/template_data.rs`
+and the `v31x` equivalent.
+
+```
+error[E0609]: no field `header_timestamp` on type `SubmitSolutionOwned`
+  available fields: `template_id`, `version`, `ntime`, `nonce`, `coinbase_tx`
+
+error[E0609]: no field `header_nonce` on type `SubmitSolutionOwned`
+  available fields: `template_id`, `version`, `ntime`, `nonce`, `coinbase_tx`
+
+error[E0560]: struct `SetNewPrevHashOwned` has no field named `header_timestamp`
+  available field: `ntime_start`
+```
+
+### Root cause
+
+`stratum_core` renamed fields between versions:
+- `SubmitSolutionOwned::header_timestamp` → `ntime`
+- `SubmitSolutionOwned::header_nonce` → `nonce`
+- `SetNewPrevHashOwned::header_timestamp` → `ntime_start`
+
+`bitcoin_core_sv2` in `sv2-integration-braidpool` still uses the old names.
+
+### Fix needed (in `braidpool/sv2-apps`)
+
+In `bitcoin-core-sv2/src/unix_capnp/v30x/template_distribution_protocol/template_data.rs`
+and the `v31x` equivalent, update field references:
+
+```rust
+// line ~260 (SubmitSolutionOwned)
+- submit_solution.header_timestamp  →  submit_solution.ntime
+- submit_solution.header_nonce      →  submit_solution.nonce
+
+// line ~270 (set_* calls)
+- set_timestamp(submit_solution.header_timestamp)  →  set_timestamp(submit_solution.ntime)
+- set_nonce(submit_solution.header_nonce)          →  set_nonce(submit_solution.nonce)
+
+// line ~104 (SetNewPrevHashOwned struct literal)
+- header_timestamp: self.get_ntime()  →  ntime_start: self.get_ntime()
+```
+
+### Impact
+
+Any Braidpool PR that adds `pool_sv2 = { git = ..., branch = "sv2-integration-braidpool" }`
+will fail CI until this is fixed. PR #595 is blocked on this.
+
+### Action
+
+- [ ] File issue on `braidpool/sv2-apps` referencing the above
+- [ ] Tag maintainers (Sansh, zaidmstrr)
+- [ ] PR #595 (`feat/sv2-pool-consumer`) stays open but marked as blocked
+
+---
+
+## 12. Audit Findings — Status After Sansh's Reference
 
 | # | Finding | Status |
 |---|---------|--------|
