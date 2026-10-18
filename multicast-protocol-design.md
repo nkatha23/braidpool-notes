@@ -146,12 +146,20 @@ series hardware and has a commercially supported track record. No SV2 multicast 
 exists today, but Braiins are the SV2 specification authors, so tproxy support is more
 likely to land here first than anywhere else.
 
-**Mujina** ([256foundation/mujina](https://github.com/256foundation/mujina)) targets
-newer and smaller hardware: Bitaxe, Avalon Nano 3S, and Antminer S19 series. It is fully
-open source under the 256 Foundation and designed for extensibility. SV2 is in active
-development. Commercial products like Nova are built on it. Because it is open source,
-a UDP multicast receiver for Option B can be contributed directly with no manufacturer
-approval required.
+**Mujina** ([256foundation/mujina](https://github.com/256foundation/mujina)) is fully
+open source under the 256 Foundation and designed for extensibility. It currently runs
+on Bitaxe Gamma (single BM1370 ASIC) and provides a CPU backend. EmberOne00 (twelve
+BM1362 ASICs) support is landing now. S19 series is a near-term target, not yet shipped.
+Mujina speaks Stratum V1; SV2 is not in mainline. Commercial products like Nova are
+built on it.
+
+The CPU backend is directly relevant here: it can be used as a test miner against
+Braidpool right now, without any hardware. That means the load generator and a multicast
+receiver prototype can be validated against real Mujina instances in a fully software
+environment before any ASIC hardware is involved.
+
+Because it is open source, a UDP multicast receiver for Option B can be contributed
+directly with no manufacturer approval required.
 
 **What this means for implementation strategy**:
 
