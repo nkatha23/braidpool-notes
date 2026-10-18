@@ -1,15 +1,15 @@
-# Stratum Scalability — Multicast Protocol Design
+# Stratum Scalability: Multicast Protocol Design
 
 ## 1. The Problem
 
 The Stratum V1 notify loop sends `mining.notify` to each connected miner sequentially
-over individual TCP connections. The dominant cost is JSON serialization — each miner's
+over individual TCP connections. The dominant cost is JSON serialization, each miner's
 `JobNotificationResponse` is serialized independently inside the loop:
 
 ```
 for each miner:
     serialize JobNotificationResponse   ← ~1–5μs (alloc + JSON encode)
-    try_send(json_string)               ← ~100–500ns (non-blocking post #543)
+    try_send(json_string)               ← ~100–500ns (non-blocking post [#543](https://github.com/braidpool/braidpool/pull/543))
 ```
 
 At Braidpool's 150ms bead rate, the window available for job delivery is narrow.
@@ -22,10 +22,10 @@ Serialization cost scales linearly with connected miners:
 | 40,000 | 40–200 ms | 27–133% |
 
 At 40,000 miners the notify loop could consume more time than the entire bead window.
-This is a correctness problem, not just a performance one — miners hashing against stale
+This is a correctness problem, not just a performance one. Miners hashing against stale
 jobs contribute stale shares, which directly degrades EDCA payout accuracy.
 
-### Bottleneck chain (post #543)
+### Bottleneck chain (post [#543](https://github.com/braidpool/braidpool/pull/543))
 
 ```
 Template arrives via IPC
@@ -50,8 +50,8 @@ miner's mpsc channel (cap 1024)
 TCP write task → miner TCP socket
 ```
 
-Before #543: step 3 could block on a slow miner, stalling the entire loop for everyone.  
-After #543: step 3 is non-blocking. Steps 1–2 are now the bottleneck.
+Before [#543](https://github.com/braidpool/braidpool/pull/543): step 3 could block on a slow miner, stalling the entire loop for everyone.  
+After [#543](https://github.com/braidpool/braidpool/pull/543): step 3 is non-blocking. Steps 1–2 are now the bottleneck.
 
 ---
 
@@ -60,14 +60,14 @@ After #543: step 3 is non-blocking. Steps 1–2 are now the bottleneck.
 Solutions are listed in order of cost. The cheapest that solves the problem at the
 target scale is the right answer.
 
-### Option A — Serialize once, share the bytes
+### Option A: Serialize once, share the bytes
 
-The payload is identical for all miners — the per-miner fields (extranonce1) are already
+The payload is identical for all miners; the per-miner fields (extranonce1) are already
 baked in before the notify loop. Serialize the JSON once, distribute an `Arc<String>` to
 each miner's channel:
 
 ```rust
-// Current (per-miner serialize — slow)
+// Current (per-miner serialize - slow)
 for (_, connection_info) in &connection_snapshot {
     let json = serde_json::to_string(&job_notification_response)?;
     connection_info.sender.try_send(json);
@@ -87,11 +87,11 @@ The channel type changes from `mpsc::Sender<String>` to `mpsc::Sender<Arc<String
 That touches `ConnectionInfo`, channel creation in `Server`, and the TCP write task in
 `server.rs`. Bounded, low-risk change.
 
-### Option B — UDP multicast on LAN
+### Option B: UDP multicast on LAN
 
 Replace the per-miner TCP send for `mining.notify` with a single UDP multicast packet.
-All miners on the same LAN segment receive it simultaneously — O(1) broadcast regardless
-of miner count. TCP stays for `mining.subscribe`, `mining.authorize`, and
+All miners on the same LAN segment receive it simultaneously, providing O(1) broadcast
+regardless of miner count. TCP stays for `mining.subscribe`, `mining.authorize`, and
 `mining.submit`.
 
 IP multicast is viable on LAN and within datacenters running IGMP snooping on managed
@@ -100,15 +100,15 @@ at consumer level. This scopes multicast to datacenter deployments, not
 internet-connected home miners.
 
 Miners need a UDP receiver to participate. Existing proprietary firmware (S19, S21
-series) does not have this. Open-source firmware does — see Mujina section below.
+series) does not have this. Open-source firmware does; see Section 3 below.
 
-### Option C — SV2 tproxy fan-out
+### Option C: SV2 tproxy fan-out
 
 The SV2 Extended Channel already solves O(N) at the pool level. The pool sends one
 `NewExtendedMiningJob` to each translator proxy (tproxy). Each tproxy fans out to its
 local miners over LAN. At 40,000 miners across 10 datacenters, the pool sends 10
 messages. The O(N) problem shifts to the tproxy→miner hop, where it happens on LAN at
-low cost — and where Option B (multicast) applies trivially if needed.
+low cost, and where Option B (multicast) applies trivially if needed.
 
 ```
 Current TCP (O(N) at pool):
@@ -130,29 +130,42 @@ than in the pool node directly.
 
 ---
 
-## 3. Mujina Relevance
+## 3. Firmware Adoption and Hardware Landscape
 
-Mujina is an open-source Bitcoin mining firmware from the 256 Foundation. It supports
-multiple ASIC chips (Antminer S19 series, Bitaxe, Avalon Nano 3S), Stratum V1, and
-extensible drivers. SV2 implementation is in active development. Commercial products
-like Nova are built on Mujina.
+Most deployed Bitcoin mining hardware runs proprietary firmware. Bitmain's Antminer S19
+and S21 series account for the majority of network hashrate. MicroBT's Whatsminer M30/M50
+series is the second-largest segment. Both ship with locked firmware that cannot be
+extended without manufacturer cooperation. Option B (UDP multicast) is not viable on
+these machines without Bitmain/MicroBT shipping a firmware update, which is not a
+realistic near-term dependency.
 
-For the multicast proposal, Mujina is relevant in two ways:
+The open-source firmware ecosystem is smaller but growing:
 
-**UDP multicast receiver (Option B)**: Because Mujina is open source, a UDP multicast
-receiver extension can be contributed directly. Any hardware running Mujina gains
-multicast support without waiting for proprietary firmware updates from Bitmain or
-similar.
+**Braiins OS** has the broadest adoption among open-source options. It runs on S9 and S19
+series hardware and has a commercially supported track record. No SV2 multicast receiver
+exists today, but Braiins are the SV2 specification authors, so tproxy support is more
+likely to land here first than anywhere else.
 
-**SV2 tproxy (Option C)**: The 256 Foundation participates in the Stratum V2 working
-group. SV2 tproxy support in Mujina is a natural follow-on — which means Option C is
-viable for Mujina-connected hardware farms without any new multicast protocol needed at
-all.
+**Mujina** ([256foundation/mujina](https://github.com/256foundation/mujina)) targets
+newer and smaller hardware: Bitaxe, Avalon Nano 3S, and Antminer S19 series. It is fully
+open source under the 256 Foundation and designed for extensibility. SV2 is in active
+development. Commercial products like Nova are built on it. Because it is open source,
+a UDP multicast receiver for Option B can be contributed directly with no manufacturer
+approval required.
 
-The practical implication: for Bitaxe and S19 hardware running Mujina, both Option B
-and Option C are achievable through open-source contributions. For hardware running
-proprietary firmware (most production ASICs today), Option B requires a firmware update
-from the manufacturer, while Option C requires deploying a tproxy.
+**What this means for implementation strategy**:
+
+Option A (serialize-once) works for all hardware with no firmware changes; the pool
+changes, not the miners. This is the right first step regardless of firmware landscape.
+
+Option C (SV2 tproxy) is the production path at scale. Miners don't need individual
+multicast support; they connect to a local tproxy over TCP as before. Firmware adoption
+is irrelevant for Option C on the pool side. For Mujina hardware specifically, native
+SV2 client support is in development, which makes the tproxy→miner hop faster still.
+
+Option B (UDP multicast) is only worth building if measurements rule out Options A and C,
+and only realistically deployable in datacenters where hardware is under operator control
+(can flash Braiins OS or Mujina, or negotiate with Bitmain directly).
 
 ---
 
@@ -163,7 +176,7 @@ from the manufacturer, while Option C requires deploying a tproxy.
 ```
 Deployment             Multicast viable?    Mechanism
 ────────────────────────────────────────────────────────────
-Localhost (CPUNet)     Yes                  Loopback — no switch involved
+Localhost (CPUNet)     Yes                  Loopback, no switch involved
 Single LAN / DC        Yes                  IGMP join, managed switch
 Multiple DCs           Conditional          Requires multicast VPN overlay
 Across internet        No                   ISPs don't route multicast
@@ -173,29 +186,29 @@ Across internet        No                   ISPs don't route multicast
 
 A managed switch with IGMP snooping forwards multicast only to ports that have sent IGMP
 join reports. Without snooping, multicast floods all ports (wasted bandwidth at scale).
-Production datacenters typically have IGMP snooping enabled by default — this works in
+Production datacenters typically have IGMP snooping enabled by default, which works in
 our favor. CPUNet testnet on a single host: IGMP snooping is irrelevant, loopback
 multicast works natively.
 
 ### WAN multicast
 
 ISPs do not route multicast across their backbone. Crossing AS boundaries requires
-PIM-SM (Protocol Independent Multicast — Sparse Mode), which is not deployed at consumer
+PIM-SM (Protocol Independent Multicast, Sparse Mode), which is not deployed at consumer
 level. Home routers and most enterprise firewalls block IGMP. NAT breaks multicast source
 address routing entirely.
 
 **Conclusion**: multicast is a LAN/datacenter feature. TCP stays for internet-connected
-miners. The `multicast_group_addr` field in `mining.subscribe` response is optional —
+miners. The `multicast_group_addr` field in `mining.subscribe` response is optional;
 miners that can't join receive `mining.notify` via TCP as before. No breaking change.
 
 ---
 
-## 5. Research Plan — In Order
+## 5. Research Plan
 
 ```
 Phase 1 (now)
   Build the load generator
-  → Immediately useful for #543 benchmarks regardless of which solution ships
+  → Immediately useful for [#543](https://github.com/braidpool/braidpool/pull/543) benchmarks regardless of which solution ships
         │
         ▼
 Phase 2 (measure)
@@ -229,7 +242,7 @@ Phase 5
 
 ---
 
-## 6. Load Generator — Implementation Guide
+## 6. Load Generator: Implementation Guide
 
 New workspace crate. Uses only existing workspace deps (`tokio`, `clap`, `serde_json`,
 `rand`).
@@ -262,7 +275,7 @@ stratum-load-gen \
   --output bench.csv
 ```
 
-`--submit-rate` is a probability per job, not every N jobs — this more closely matches
+`--submit-rate` is a probability per job, not every N jobs, which more closely matches
 real miner behavior at varying difficulties.
 
 ### Core miner task
@@ -311,8 +324,8 @@ pub async fn simulate_miner(
 }
 ```
 
-**End-to-end latency note**: true pool-send → miner-receive requires synchronized clocks
-(NTP gives ~1ms precision — too coarse for μs measurements). Run pool and load generator
+**End-to-end latency note**: true pool-send to miner-receive requires synchronized clocks
+(NTP gives ~1ms precision, too coarse for μs measurements). Run pool and load generator
 on the same host. Loopback gives sub-microsecond clock accuracy, which is the right
 setup for CPUNet benchmarks.
 
@@ -344,7 +357,7 @@ One row per event. Aggregate with `--analyze bench.csv` mode or externally in pa
 
 ---
 
-## 7. If Multicast Proceeds — Protocol Design
+## 7. If Multicast Proceeds: Protocol Design
 
 Only proceed here if Phase 3a measurements at the target miner count are still
 unacceptable.
@@ -352,7 +365,7 @@ unacceptable.
 ### Subscribe extension
 
 Optional `multicast_group_addr` field in `mining.subscribe` response. Miners that don't
-understand it continue receiving `mining.notify` via TCP — no breaking change:
+understand it continue receiving `mining.notify` via TCP with no breaking change:
 
 ```json
 {
@@ -368,7 +381,7 @@ understand it continue receiving `mining.notify` via TCP — no breaking change:
 ```
 
 Pool tracks miner presence via the existing TCP connection. No separate multicast-layer
-bookkeeping — if TCP drops, the miner is gone.
+bookkeeping. If TCP drops, the miner is gone.
 
 ### Binary packet format
 
@@ -408,7 +421,7 @@ Typical total:                      ~625 bytes  ✓
 Worst case (32 branches):          ~1283 bytes  ✓
 ```
 
-### Reliability — sequence + retransmit
+### Reliability: sequence + retransmit
 
 **Miner side**: track last received `sequence_number`. On gap (N+2 received, N+1 missing):
 send unicast TCP retransmit request on the existing control connection:
@@ -419,12 +432,12 @@ send unicast TCP retransmit request on the existing control connection:
 **Pool side**: ring buffer of last 20 multicast packets (~3 seconds at 150ms bead rate).
 On `mining.get_job`: look up sequence in ring buffer, unicast TCP reply.
 
-TCP for retransmit is the right call — the connection already exists, retransmits are
+TCP for retransmit is the right call. The connection already exists, retransmits are
 rare loss events, and there's nothing to gain from managing a separate UDP unicast socket.
 
 **FEC extension point (v0.7)**: when `flags` bit 1 is set, FEC parity data is appended
 after the merkle branches. The `version` byte bumps to 2 when FEC is active. Not
-designed here — just the reserved bit and version bump mechanism to avoid a format break
+designed here, just the reserved bit and version bump mechanism to avoid a format break
 when FEC ships.
 
 ---
@@ -433,7 +446,7 @@ when FEC ships.
 
 | Option | Code change | Scale benefit | Firmware required | Use when |
 |--------|------------|--------------|------------------|----------|
-| Status quo (post #543) | 0 | — | None | <500 miners |
+| Status quo (post [#543](https://github.com/braidpool/braidpool/pull/543)) | 0 | — | None | <500 miners |
 | Serialize-once | ~20 lines | 10–100× CPU | None | 500–10,000 miners |
 | UDP multicast (LAN) | ~500 lines | O(1) broadcast | UDP receiver | >10,000 miners on LAN |
 | SV2 tproxy | 0 at pool | O(regions) | SV2 tproxy | Production at any scale |
@@ -443,11 +456,11 @@ when FEC ships.
 ## 9. Resources
 
 ### RFCs
-- RFC 1112 — Host Extensions for IP Multicasting
-- RFC 2236 — IGMPv2
-- RFC 3376 — IGMPv3
-- RFC 2365 — Administratively Scoped IP Multicast (239.x.x.x)
-- RFC 4607 — Source-Specific Multicast
+- RFC 1112: Host Extensions for IP Multicasting
+- RFC 2236: IGMPv2
+- RFC 3376: IGMPv3
+- RFC 2365: Administratively Scoped IP Multicast (239.x.x.x)
+- RFC 4607: Source-Specific Multicast
 
 ### SV2 / Stratum
 - SV2 spec: https://stratumprotocol.org/specification/
@@ -456,7 +469,7 @@ when FEC ships.
 - SV2 Extended Channel: spec §6.1
 
 ### Mujina / 256 Foundation
-- Mujina firmware: https://github.com/skot/mujina
+- Mujina firmware: https://github.com/256foundation/mujina
 - 256 Foundation: https://256foundation.org
 
 ### Rust
@@ -472,7 +485,7 @@ when FEC ships.
 | `node/src/stratum/connection.rs` | `ConnectionInfo`, channel types |
 | `node/src/stratum/server.rs` | Channel creation, TCP accept loop |
 | `node/src/lib.rs` | `ipc_template_consumer`, `template_ready_at` capture |
-| `node/src/stratum/client.rs` | `handle_subscribe` — where multicast addr would be sent |
+| `node/src/stratum/client.rs` | `handle_subscribe`, where multicast addr would be sent |
 
 ---
 
@@ -487,7 +500,7 @@ when FEC ships.
    Mujina hardware with no new protocol needed.
 
 4. Does `socket2` (`features = ["all"]`, already in `node/Cargo.toml`) expose
-   `IP_ADD_MEMBERSHIP` on Linux? Expected yes — verify before writing the multicast
+   `IP_ADD_MEMBERSHIP` on Linux? Expected yes; verify before writing the multicast
    sender.
 
 ---
@@ -500,4 +513,4 @@ when FEC ships.
 | Serialize-once is Phase 3a, before any protocol design | 20-line fix may be sufficient |
 | Multicast scoped to LAN/datacenter only | WAN multicast not viable at ISP level |
 | FEC deferred to v0.7, flags bit 1 reserved now | Avoids format break when FEC ships |
-| Load generator as separate workspace crate in `tools/` | No server changes, usable immediately for #543 benchmarks |
+| Load generator as separate workspace crate in `tools/` | No server changes, usable immediately for [#543](https://github.com/braidpool/braidpool/pull/543) benchmarks |
