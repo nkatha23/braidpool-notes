@@ -1,10 +1,4 @@
 # Stratum Module Refactor — Decisions & Trade-offs
-
-**Branch**: `refactor/stratum-module-split`  
-**Date**: 2026-10-01  
-**Author**: nkatha23  
-**Reviewer/pair**: Claude (claude-sonnet-4-6)
-
 ---
 
 ## Why We Did This
