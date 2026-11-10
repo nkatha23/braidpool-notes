@@ -410,29 +410,66 @@ let sv2_template_tx = args.sv2_pool_port.map(|port| {
 });
 ```
 
-SV1 stratum service runs unchanged in parallel. SV2 is purely additive. `propagate_valid_bead` wiring deferred to PR 5.
+SV1 stratum service runs unchanged in parallel. SV2 is purely additive. `propagate_valid_bead` wiring deferred to a later PR.
 
 ---
 
-### braidpool PR 5 — Translator binary
+### braidpool PR 5 — Translator binary (thin wrapper)
 
-**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-translator-binary` (not yet created)  
-**Depends on:** braidpool PR #561 merged
+**GitHub:** `braidpool/braidpool#637`  **Branch:** `feat/sv2-translator`  **Status:** Draft  
+**Depends on:** braidpool PR #561 merged, sv2-apps PRs #1/#2 merged
 
-New binary crate at workspace root. Uses `miner-apps/translator` from `braidpool/sv2-apps` fork as the core. Braidpool-specific additions: extranonce subdivision using 4-byte prefix (normal mode), `mining.notify` construction using merkle root computed from `BraidpoolTemplate.merkle_path`.
+Thin binary crate at workspace root. Delegates entirely to SRI's `translator_sv2` crate from the sv2-apps fork — no Braidpool-specific extranonce logic. Gets SV1 miners connected to the SV2 pool end-to-end.
 
-Config `translator.toml`:
+```toml
+[dependencies]
+translator_sv2 = { git = "https://github.com/braidpool/sv2-apps", branch = "sv2-integration-braidpool" }
+stratum_apps   = { git = "https://github.com/braidpool/sv2-apps", branch = "sv2-integration-braidpool" }
+```
+
+`main.rs` is 30 lines: load config → `TranslatorSv2::new(config)` → `translator.start()` + Ctrl+C shutdown.
+
+Config (`braidpool-translator.toml.example`):
 ```toml
 [upstream]
-pool_address = "127.0.0.1:34254"
-authority_pubkey = "..."  # must match pool's keypair
+pool_address    = "127.0.0.1:34254"
+authority_pubkey = "..."  # must match pool's --sv2-authority-pubkey
 
 [downstream]
-listen_address = "0.0.0.0:3333"
+listen_address      = "0.0.0.0:3355"
 min_extranonce2_size = 6
 ```
 
-**Test:** End-to-end — pool + translator + mock SV1 miner. Full `subscribe → authorize → notify → submit → success` cycle.
+**What this does NOT do:** Braidpool commitment embedding in the extranonce. Standard SRI extranonce subdivision only. Commitment embedding is PR 6.
+
+---
+
+### braidpool PR 6 — Extranonce commitment embedding (audit mode)
+
+**Branch:** `feat/sv2-translator-audit` (not yet created)  
+**Depends on:** PR #637 merged
+
+Extends the translator with Braidpool-specific extranonce subdivision for audit mode. Overrides SRI's default extranonce handling to embed the 5-byte commitment in the extranonce sent to each miner.
+
+**Audit mode layout (what this PR implements):**
+```
+extranonce_size requested = 8  (2B slot + 5B commitment + 1B roll)
+ext1 to miner = pool_prefix[4] + slot[2] + commitment[5] = 11B
+ext2 to miner =                                             1B
+```
+
+**Reconstruction before upstream submit:**
+```
+reconstructed ext1 = pool_prefix[4]
+reconstructed ext2 = slot[2] + commitment[5] + rolling[1] = 8B
+```
+
+**Key work:**
+- Override `OpenExtendedMiningChannel` to request `extranonce_size = 8` instead of the default
+- Per-miner slot assignment (2B, up to 65,536 miners)
+- Commitment bytes derived from `BraidpoolTemplate` fields (committed metadata hash)
+- Strip commitment on `SubmitSharesExtended` before forwarding upstream
+- `ValidatedShare.extranonce1` carries the full 11B for UHPO attribution
 
 ---
 
@@ -490,8 +527,14 @@ braidpool PR #561 (node wiring + real PoolSv2 consumer — combines old PR 4 + P
     branch: feat/sv2-pool-wiring
     note: PR #595 closed, work folded into #561
     ↓
-braidpool PR 5 (translator binary)
-    branch: feat/sv2-translator-binary — not yet created
+braidpool PR #637 / PR 5 (translator binary — thin SRI wrapper)
+    branch: feat/sv2-translator  Status: Draft
+    gets SV1 miners connected; no commitment embedding yet
+    ↓
+braidpool PR 6 (extranonce commitment embedding — audit mode)
+    branch: feat/sv2-translator-audit — not yet created
+    overrides SRI extranonce: slot[2] + commitment[5] + rolling[1] = 8B
+    strips commitment before upstream submit
 ```
 
 **Prerequisites already done:** #492, #503 merged.
