@@ -214,9 +214,18 @@ pub const EXTRANONCE_SEPARATOR: [u8; 16] = [1u8; 16];
 
 ## 8. The PRs — Current State
 
+### sv2-apps PR #4 — Fix `bitcoin-core-sv2` field renames (compile blocker)
+
+**GitHub:** `braidpool/sv2-apps#4`  **Branch:** `fix/bitcoin-core-sv2-field-renames`  **Status:** CLOSED — resolved upstream  
+
+The field renames were fixed in `stratum-mining/sv2-apps` (commit `14841ab7`: "refactor!: adapt to the ntime_start, ntime and nonce field renames") and pulled into `braidpool/sv2-apps:sv2-integration-braidpool` via upstream sync. PR #4 was redundant and has been closed. Issue `braidpool/sv2-apps#3` is resolved.
+
+---
+
 ### sv2-apps PR #1 — `braidpool-common` + `braidpool-template-provider` (combines original PR 0 + PR 1)
 
-**GitHub:** `braidpool/sv2-apps#1`  **Branch:** `braidpool/template-provider`  **Status:** Open
+**GitHub:** `braidpool/sv2-apps#1`  **Branch:** `braidpool/template-provider`  **Status:** Open  
+**Depends on:** sv2-apps PR #4 merged
 
 `braidpool-common` and `braidpool-template-provider` were merged into a single PR since both are prerequisites with no reviewable split. `braidpool-common` defines `BraidpoolTemplate` (the shared type boundary); `braidpool-template-provider` consumes it and produces SV2 `TemplateDistribution` messages.
 
@@ -314,9 +323,9 @@ Key decisions:
 **`PoolSv2` new API:**
 ```rust
 // Builder — call before start() when template_provider_type = BraidpoolIpc
-pub fn with_braidpool_template_rx(
+pub fn with_braidpool_template_watch(
     self,
-    rx: tokio::sync::mpsc::Receiver<BraidpoolTemplate>,
+    rx: tokio::sync::watch::Receiver<Option<BraidpoolTemplate>>,
 ) -> Self
 
 // Updated start() — delivers ShareBridgeReceiver to caller before blocking on shutdown
@@ -326,9 +335,9 @@ pub async fn start(
 ) -> Result<(), PoolErrorKind>
 ```
 
-`braidpool_template_rx` is stored as `Arc<std::sync::Mutex<Option<Receiver>>>` on `PoolSv2` so the struct stays `Clone`. It is taken out once during `PoolRuntime::new()` and consumed in `bootstrap_template_provider`.
+`braidpool_template_rx` is stored as `Arc<std::sync::Mutex<Option<watch::Receiver<Option<BraidpoolTemplate>>>>>` on `PoolSv2` so the struct stays `Clone`. It is taken out once during `PoolRuntime::new()` and consumed in `bootstrap_template_provider`.
 
-`BraidpoolIpc` in `bootstrap_template_provider` spawns `sv2_template_consumer` as a managed task. It errors with `PoolErrorKind::Configuration` if `with_braidpool_template_rx()` was not called before `start()`. `BraidpoolIpc` is also blocked from using JDS (same as `Sv2Tp` — requires `BitcoinCoreIpc`).
+`BraidpoolIpc` in `bootstrap_template_provider` spawns `sv2_template_consumer` as a managed task. It errors with `PoolErrorKind::Configuration` if `with_braidpool_template_watch()` was not called before `start()`. `BraidpoolIpc` is also blocked from using JDS (same as `Sv2Tp` — requires `BitcoinCoreIpc`).
 
 TOML config for `BraidpoolIpc`:
 ```toml
@@ -338,101 +347,67 @@ template_provider_type = "BraidpoolIpc"
 
 ---
 
-### braidpool PR 4 — Wire node to produce BraidpoolTemplate for SV2 pool
+### braidpool PR #561 — Wire node to produce BraidpoolTemplate + real PoolSv2 consumer (combines original PR 4 + PR 5)
 
-**GitHub:** `braidpool/braidpool#561`  **Branch:** `feat/sv2-pool-wiring`  **Status:** Open (ready, `.expect()` fix applied)
+**GitHub:** `braidpool/braidpool#561`  **Branch:** `feat/sv2-pool-wiring`  **Status:** Open  
+**Note:** PR #595 (`feat/sv2-pool-consumer`) was closed; its work was folded into #561 directly.  
+**Depends on:** sv2-apps PRs #4, #1, #2 all merged
 
-Adds `BraidpoolTemplate` production from `ipc_template_consumer` and the SV2 template channel in `main.rs`. Currently has a drain task placeholder where the real pool consumer will go.
+This PR does two things in one branch:
+1. Produces `BraidpoolTemplate` from `ipc_template_consumer` and wires the SV2 template channel in `main.rs`
+2. Replaces the drain task placeholder with the real `PoolSv2` consumer and `ShareBridgeReceiver` logging
 
-Key CLI args already added:
+Key CLI args added:
 ```
 --sv2-pool-port <PORT>         SV2 pool listen port — enables SV2 mode when set
 --sv2-authority-pubkey <HEX>   Pool authority public key (Noise NX)
 --sv2-authority-seckey <HEX>   Pool authority secret key
 ```
 
-`BraidpoolTemplate` channel wiring in `main.rs` (current state — drain task):
-```rust
-let sv2_template_tx = args.sv2_pool_port.map(|port| {
-    let (tx, rx) = mpsc::channel::<BraidpoolTemplate>(32);
-    // TODO(sv2-integration/PR5): replace this drain task with the real sv2-apps pool consumer
-    tokio::spawn(async move { while let Some(_) = rx.recv().await {} });
-    tx
-});
-```
-
-SV1 stratum service runs unchanged in parallel. SV2 is purely additive.
-
----
-
-### braidpool PR 5 — Replace drain task with real sv2-apps pool consumer
-
-**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-pool-consumer` (not yet created)  
-**Depends on:** sv2-apps PR #2 merged (needs `BraidpoolIpc`, `PoolSv2::with_braidpool_template_rx`, `ShareBridgeReceiver`)  
-**Depends on:** braidpool PR 4 merged (needs the drain task and `sv2_template_tx` to exist)
-
-**`node/Cargo.toml`** additions:
+**`node/Cargo.toml`** additions (added when #595 was folded in):
 ```toml
 pool_sv2 = { git = "https://github.com/braidpool/sv2-apps", branch = "sv2-integration-braidpool" }
 
-# Tell Cargo to use our local braidpool-common when pool_sv2 also needs it
-# (avoids duplicate crate in the dep graph)
 [patch."https://github.com/braidpool/sv2-apps"]
 braidpool-common = { path = "./braidpool-common" }
 ```
 
-**`node/src/cli.rs`** additions:
-```rust
-/// Bitcoin address for the pool's coinbase payout output. Required when --sv2-pool-port is set.
-#[arg(long)]
-pub sv2_pool_coinbase_addr: Option<String>,
-```
-
-**`node/src/main.rs`** — replace drain task:
+**`node/src/main.rs`** — real pool consumer wiring (uses `watch` channel):
 ```rust
 let sv2_template_tx = args.sv2_pool_port.map(|port| {
-    let (tx, rx) = mpsc::channel::<BraidpoolTemplate>(32);
-
-    let pool_config = build_sv2_pool_config(&args, port);  // helper to build PoolConfig from CLI args
-    let pool = PoolSv2::new(pool_config).with_braidpool_template_rx(rx);
-
+    let (tx, rx) = watch::channel::<Option<BraidpoolTemplate>>(None);
+    let pool_config = build_sv2_pool_config(&args, port);
+    let pool = PoolSv2::new(pool_config).with_braidpool_template_watch(rx);
     let (share_rx_tx, share_rx_rx) = tokio::sync::oneshot::channel();
-
     tokio::spawn(async move {
         if let Err(e) = pool.start(Some(share_rx_tx)).await {
             error!("SV2 pool exited with error: {e}");
         }
     });
-
     tokio::spawn(async move {
         match share_rx_rx.await {
             Ok(mut share_receiver) => {
                 while let Some(share) = share_receiver.recv().await {
                     // TODO: propagate_valid_bead(share) — wires into bead DAG
-                    info!(
-                        template_id = ?share.template_id,
-                        channel_id = share.channel_id,
-                        "ValidatedShare received from SV2 pool"
-                    );
+                    info!(template_id = ?share.template_id, channel_id = share.channel_id, "ValidatedShare received from SV2 pool");
                 }
             }
             Err(_) => warn!("SV2 pool shut down before share bridge was ready"),
         }
     });
-
     info!(port = port, "SV2 pool started in BraidpoolIpc mode");
     tx
 });
 ```
 
-`propagate_valid_bead` wiring is deferred to PR 6 — this PR gets the channel running and logs shares.
+SV1 stratum service runs unchanged in parallel. SV2 is purely additive. `propagate_valid_bead` wiring deferred to PR 5.
 
 ---
 
-### braidpool PR 6 — Translator binary
+### braidpool PR 5 — Translator binary
 
-**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-translator-binary`  
-**Depends on:** PR 5 merged
+**Target:** `nkatha23/braidpool → braidpool/braidpool`  **Branch:** `feat/sv2-translator-binary` (not yet created)  
+**Depends on:** braidpool PR #561 merged
 
 New binary crate at workspace root. Uses `miner-apps/translator` from `braidpool/sv2-apps` fork as the core. Braidpool-specific additions: extranonce subdivision using 4-byte prefix (normal mode), `mining.notify` construction using merkle root computed from `BraidpoolTemplate.merkle_path`.
 
@@ -451,34 +426,71 @@ min_extranonce2_size = 6
 
 ---
 
-## 9. PR Ordering
+## 9. Template Channel Design — watch vs mpsc
 
-```
-sv2-apps PR #1 (braidpool-common + braidpool-template-provider)
-    branch: braidpool/template-provider
-    ↓ must merge first — PR #2 imports from these crates
-sv2-apps PR #2 (share bridge + ValidatedShare + BraidpoolIpc wiring)
-    branch: braidpool/noise-channel-manager
-    ↓ after PR #1 merges: git fetch && git rebase upstream/sv2-integration-braidpool
-    ↓ cherry-picked commits will drop; only 4 commits remain
-    ↓ (both sv2-apps PRs merged into sv2-integration-braidpool)
-braidpool PR 4 (node produces BraidpoolTemplate, drain task)
-    branch: feat/sv2-pool-wiring (#561) — ready, pending merge
-    ↓
-braidpool PR 5 (replace drain task with real PoolSv2 consumer)
-    branch: feat/sv2-pool-consumer — not yet created
-    ↓
-braidpool PR 6 (translator binary)
-    branch: feat/sv2-translator-binary
-```
+The node→pool template channel was originally `tokio::sync::mpsc`. It was changed to `tokio::sync::watch` in PR #561 (node) and sv2-apps PRs #1/#2 (pool) for three reasons:
 
-**Also required before braidpool PR 4:** #492, #503 merged to `braidpool:dev` (both done as of 2026-10-13).
+**1. mpsc blocks or silently drops on a new block tip.**
+A bounded mpsc blocks `ipc_template_consumer` if the pool is slow — the IPC connection to Bitcoin Core stalls. An unbounded mpsc queues stale templates; the pool works through N−1 stale blocks before reaching the current tip, keeping miners on stale work the entire time.
 
-**Key interdependency note:** sv2-apps PR #2 imports `BraidpoolTemplate` from `braidpool-common` (PR #1) and calls `sv2_template_consumer` from `braidpool-template-provider` (PR #1). It will not compile without PR #1. The cherry-pick on `noise-channel-manager` was undone — after PR #1 merges, rebase PR #2 onto `sv2-integration-braidpool` to get a clean self-contained branch.
+**2. watch is latest-wins and non-blocking.**
+`watch::send()` always overwrites the slot and returns immediately. If two `TipChanged` events arrive while the pool is busy, they collapse to one. The pool always wakes up to the freshest template, never a queued stale one.
+
+**3. Clean shutdown detection.**
+When the node drops `watch::Sender`, `rx.changed()` returns `Err(RecvError)` — the pool's `sv2_template_consumer` exits cleanly. With mpsc, a dropped sender just means `recv()` returns `None` — same behaviour, but watch makes it explicit and symmetrical with the `Err` path.
+
+**Height guard in `ipc_template_consumer` (node/src/lib.rs):**
+Bitcoin Core sends an initial template before `TipChanged` arrives, with `height = 0`. This is a placeholder. The node skips forwarding it over the watch channel (`height == 0` guard) so the pool never receives a zero-height phantom template. The `None` sentinel that `watch::channel` is initialized with serves the same role at the pool end — `borrow_and_update()` returns `None` for the initial value and `sv2_template_consumer` skips it with `None => continue`.
+
+**Latency pipeline (two layers — not redundant):**
+
+| Layer | What it fixes | PRs |
+|-------|--------------|-----|
+| 1 — IPC → SV2 forward | Node's IPC loop never stalls; pool always holds the latest template | #561 (watch channel) |
+| 2 — Pool → per-miner fanout | Miners receive `NewExtendedMiningJob` (future job) before `SetNewPrevHash` arrives — zero-latency job activation | #528, #543 |
+
+Layer 1 ensures the template is current when Layer 2 fanout fires. Fixing only Layer 2 without Layer 1 means the fanout can run on a stale template from a queued mpsc message.
+
+**Files changed for the watch migration:**
+
+| File | Change |
+|------|--------|
+| `node/src/lib.rs` | `ipc_template_consumer` takes `watch::Sender<Option<BraidpoolTemplate>>`; height guard; closed-sender detection sets sender to `None` |
+| `node/src/main.rs` | `watch::channel(None)` replaces mpsc; `with_braidpool_template_watch(rx)` |
+| `node/src/ipc.rs` | `get_template()` gains `block_height: u32`; initial call gets `0` |
+| `sv2-apps pool/mod.rs` | `with_braidpool_template_watch(watch::Receiver<Option<...>>)` replaces `with_braidpool_template_rx` |
+| `sv2-apps pool/pool_runtime.rs` | Field type updated to `watch::Receiver<Option<...>>` |
+| `sv2-apps braidpool-tp/lib.rs` | `sv2_template_consumer` takes `watch::Receiver`; loop uses `changed()` + `borrow_and_update()`; `None => continue` skips sentinel |
 
 ---
 
-## 10. Dependency Versions — Verify First
+## 11. PR Ordering
+
+```
+[sv2-apps PR #4 CLOSED — compile blocker resolved upstream via stratum-mining sync]
+sv2-apps PR #1 (braidpool-common + braidpool-template-provider)
+    branch: braidpool/template-provider → sv2-integration-braidpool
+    ↓ must merge before PR #2 — PR #2 imports these crates
+sv2-apps PR #2 (share bridge + ValidatedShare + BraidpoolIpc wiring)
+    branch: braidpool/noise-channel-manager → sv2-integration-braidpool
+    ↓ after PR #1 merges: git fetch && git rebase upstream/sv2-integration-braidpool
+    ↓ cherry-picked commits will drop automatically; only the 4 commits above remain
+    ↓ (all sv2-apps PRs merged into sv2-integration-braidpool)
+braidpool PR #561 (node wiring + real PoolSv2 consumer — combines old PR 4 + PR 5)
+    branch: feat/sv2-pool-wiring
+    note: PR #595 closed, work folded into #561
+    ↓
+braidpool PR 5 (translator binary)
+    branch: feat/sv2-translator-binary — not yet created
+```
+
+**Prerequisites already done:** #492, #503 merged.
+
+**Key interdependency note:** sv2-apps PR #2 imports `BraidpoolTemplate` from `braidpool-common` (PR #1) and calls `sv2_template_consumer` from `braidpool-template-provider` (PR #1). It will not compile without PR #1. After PR #1 merges, rebase PR #2 onto `sv2-integration-braidpool` — duplicate cherry-picked commits drop automatically.
+
+---
+
+## 12. Dependency Versions — Verify First
 
 ```bash
 # In sv2-apps
@@ -494,76 +506,15 @@ Resolve any version conflict in a standalone commit before PR 1.
 
 ---
 
-## 11. Upstream Blocker — `bitcoin_core_sv2` Compile Error on `sv2-integration-braidpool`
+## 13. Upstream Blocker — ~~`bitcoin_core_sv2` Compile Error on `sv2-integration-braidpool`~~ RESOLVED
 
-### Summary
+**Status: RESOLVED** — Fixed in `stratum-mining/sv2-apps` commit `14841ab7` ("refactor!: adapt to the ntime_start, ntime and nonce field renames") and pulled into `braidpool/sv2-apps:sv2-integration-braidpool` via upstream sync (as of 2026-10-23). sv2-apps PR #4 was opened for this but closed as redundant once the sync landed.
 
-Adding `pool_sv2` as a git dep in `node/Cargo.toml` (PR #595) causes CI to fail
-because `bitcoin_core_sv2` — a transitive dependency inside the
-`sv2-integration-braidpool` branch of `braidpool/sv2-apps` — does not compile
-against the current version of `stratum_core`.
-
-### Failing crate
-
-`bitcoin_core_sv2 v0.5.0` at commit `9d49b984` on `sv2-integration-braidpool`.
-
-### Errors (10 total, two files affected)
-
-**File**: `bitcoin-core-sv2/src/unix_capnp/v30x/template_distribution_protocol/template_data.rs`
-and the `v31x` equivalent.
-
-```
-error[E0609]: no field `header_timestamp` on type `SubmitSolutionOwned`
-  available fields: `template_id`, `version`, `ntime`, `nonce`, `coinbase_tx`
-
-error[E0609]: no field `header_nonce` on type `SubmitSolutionOwned`
-  available fields: `template_id`, `version`, `ntime`, `nonce`, `coinbase_tx`
-
-error[E0560]: struct `SetNewPrevHashOwned` has no field named `header_timestamp`
-  available field: `ntime_start`
-```
-
-### Root cause
-
-`stratum_core` renamed fields between versions:
-- `SubmitSolutionOwned::header_timestamp` → `ntime`
-- `SubmitSolutionOwned::header_nonce` → `nonce`
-- `SetNewPrevHashOwned::header_timestamp` → `ntime_start`
-
-`bitcoin_core_sv2` in `sv2-integration-braidpool` still uses the old names.
-
-### Fix needed (in `braidpool/sv2-apps`)
-
-In `bitcoin-core-sv2/src/unix_capnp/v30x/template_distribution_protocol/template_data.rs`
-and the `v31x` equivalent, update field references:
-
-```rust
-// line ~260 (SubmitSolutionOwned)
-- submit_solution.header_timestamp  →  submit_solution.ntime
-- submit_solution.header_nonce      →  submit_solution.nonce
-
-// line ~270 (set_* calls)
-- set_timestamp(submit_solution.header_timestamp)  →  set_timestamp(submit_solution.ntime)
-- set_nonce(submit_solution.header_nonce)          →  set_nonce(submit_solution.nonce)
-
-// line ~104 (SetNewPrevHashOwned struct literal)
-- header_timestamp: self.get_ntime()  →  ntime_start: self.get_ntime()
-```
-
-### Impact
-
-Any Braidpool PR that adds `pool_sv2 = { git = ..., branch = "sv2-integration-braidpool" }`
-will fail CI until this is fixed. PR #595 is blocked on this.
-
-### Action
-
-- [ ] File issue on `braidpool/sv2-apps` referencing the above
-- [ ] Tag maintainers (Sansh, zaidmstrr)
-- [ ] PR #595 (`feat/sv2-pool-consumer`) stays open but marked as blocked
+The compile blocker no longer affects PR #561 or any future braidpool PRs that add `pool_sv2 = { git = ..., branch = "sv2-integration-braidpool" }` as a dependency.
 
 ---
 
-## 12. Audit Findings — Status After Sansh's Reference
+## 14. Audit Findings 
 
 | # | Finding | Status |
 |---|---------|--------|
@@ -571,7 +522,7 @@ will fail CI until this is fixed. PR #595 is blocked on this.
 | 2 | OP_RETURN in suffix | Confirmed correct — outputs are in `coinbase_tx_suffix` |
 | 3 | extranonce1 = 4 bytes | Confirmed — `UPSTREAM_EXTRANONCE1_SIZE = 4` |
 | 4 | Audit extranonce 11 bytes | Handled — `ValidatedShare.extranonce1: Vec<u8>` |
-| 5 | mpsc single consumer | Fix in PR 4 — broadcast fanout |
+| 5 | mpsc single consumer / stale template on backpressure | Fixed — switched to `watch::channel`; latest-wins, non-blocking, any number of receivers |
 | 6 | PoolNetwork doesn't exist | Use `bitcoin::Network` directly |
 | 7 | height = Zero | Fixed — `BraidpoolTemplate.height` from `ipc_template.components` |
 | 8 | f64 precision in PoW | Fixed in PR 3 — use U256 target from SetTarget |
