@@ -128,7 +128,7 @@ let (swarm_handler, swarm_command_receiver) = SwarmHandler::new(
 | `braidpool-common/src/lib.rs` | Currently exports only cpunet and error — shared type boundary |
 | `node/src/config.rs` | `bitcoin::Network` with CPUNet variant — no `PoolNetwork` enum |
 
-**In Sansh's `sv2-integration-braidpool` branch (from `171a9a4`):**
+**In `sv2-integration-braidpool` branc:**
 
 | File | What to understand |
 |------|-------------------|
