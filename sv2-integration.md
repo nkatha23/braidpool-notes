@@ -164,43 +164,53 @@ Three options:
 
 ## 7. Extranonce Layout
 
-Braidpool supports two upstream pool configurations. The upstream pool negotiates extranonce sizes during `SetupConnection`; Braidpool adapts internally but always reconstructs the originally agreed format before submitting shares upstream.
+The translator proxy opens an Extended Channel against Braidpool's pool. The pool assigns a 4-byte prefix to that channel and tells the translator how many bytes it may use for its own extranonce (`extranonce_size`). The translator subdivides that budget across all downstream miners. Two operating modes:
 
-### Upstream configuration 1 — 4+8 (common)
+### Normal Mode
 
-The upstream pool allocates 4 bytes for extranonce1 and 8 bytes for extranonce2.
+Commitment bytes are not embedded in the extranonce — used when downstream miners don't need on-chain auditability.
 
-Braidpool internally uses:
 ```
-extranonce1 (sent to miners) = upstream_ext1[4] + prefix[2] + commitment[5] = 11 bytes
-extranonce2 (miner-controlled)                                               =  1 byte
-```
-
-Before submitting a share upstream, Braidpool reconstructs:
-```
-reconstructed_extranonce1 = upstream_ext1[4]
-reconstructed_extranonce2 = prefix[2] + commitment[5] + rolling[1] = 8 bytes
-```
-
-### Upstream configuration 2 — 8+8
-
-The upstream pool allocates 8 bytes for extranonce1 and 8 bytes for extranonce2.
-
-Braidpool internally uses:
-```
-extranonce1 (sent to miners) = upstream_ext1[8] + prefix[2] + commitment[5] = 15 bytes
-extranonce2 (miner-controlled)                                               =  3 bytes
+extranonce_size requested by tproxy = 12
+─────────────────────────────────────────
+Pool prefix:   4B  pool-assigned, same for all miners on this channel
+Miner slot:    2B  tproxy-assigned, unique per miner (up to 65,536 miners)
+Miner rolls:  10B  ~281 trillion combinations per nonce roll
+─────────────────────────────────────────
+ext1 to miner = pool_prefix[4] + slot[2] = 6B
+ext2 to miner =                            10B
+Total         = 4 + 2 + 10              = 16B
 ```
 
-Before submitting a share upstream, Braidpool reconstructs:
+### Audit Mode
+
+The 5-byte Braidpool commitment is embedded in the extranonce. Every share is auditable against the commitment without additional messaging.
+
 ```
-reconstructed_extranonce1 = upstream_ext1[8]
-reconstructed_extranonce2 = prefix[2] + commitment[5] + rolling[3] = 8 bytes
+extranonce_size requested by tproxy = 8
+─────────────────────────────────────────
+Pool prefix:          4B  pool-assigned
+Miner slot:           2B  tproxy-assigned, unique per miner
+Braidpool commitment: 5B  metadata hash, fixed per slot
+Miner rolls:          1B  256 combinations — all auditable
+─────────────────────────────────────────
+ext1 to miner = pool_prefix[4] + slot[2] + commitment[5] = 11B
+ext2 to miner =                                             1B
+Total         = 4 + 2 + 5 + 1                            = 12B
 ```
 
-### Why reconstruction is needed
+The 1-byte miner roll (256 nonces per slot) is sufficient because Braidpool's weak-block target is set high enough that miners find a qualifying share well within 256 rolls.
 
-The upstream pool only accepts the extranonce format it originally agreed to (e.g. 4+8). Braidpool embeds the commitment bytes inside the extranonce space it sends to downstream miners, then strips them back out before forwarding the share upstream so the share validates correctly.
+### Reconstruction before upstream submit
+
+The pool originally agreed to `extranonce_prefix=4B, extranonce_size=8B`. When forwarding a share upstream, the translator strips the commitment back out:
+
+```
+reconstructed ext1 = pool_prefix[4]
+reconstructed ext2 = slot[2] + commitment[5] + rolling[1] = 8B  ✓
+```
+
+The upstream pool sees exactly the 4+8 format it negotiated — it never sees the internal slot/commitment breakdown.
 
 ### Constants (from `node/src/lib.rs`)
 
