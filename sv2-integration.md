@@ -565,6 +565,13 @@ Resolve any version conflict in a standalone commit before PR 1.
 
 The compile blocker no longer affects PR #561 or any future braidpool PRs that add `pool_sv2 = { git = ..., branch = "sv2-integration-braidpool" }` as a dependency.
 
+> ⚠️ **Re-surfaced (2026-11-20):** reviewing #637, `cargo check` against
+> `sv2-integration-braidpool` at commit `9d49b98` hit this exact error again —
+> `stratum-apps` fails against `stratum_core` with 13 errors (`codec_sv2::Error::MissingBytes`
+> not found, etc.). So the field-rename fix may **not** actually be on the current
+> branch HEAD, or a later commit regressed it. **Verify `sv2-integration-braidpool`
+> compiles standalone before claiming the stack is green** — #637 at minimum does not.
+
 ---
 
 ## 14. Audit Findings 
@@ -581,3 +588,65 @@ The compile blocker no longer affects PR #561 or any future braidpool PRs that a
 | 8 | f64 precision in PoW | Fixed in PR 3 — use U256 target from SetTarget |
 | 9 | Per-peer job map | Fixed — write against post-#492 `GlobalJobStore` |
 | 10 | Placeholder pubkey | Fixed — Sansh's auth key flows into `SwarmHandler::new` in PR 2 |
+
+---
+
+## 15. Future: End-to-End Latency Instrumentation (micro-timestamps)
+
+**Status: future work — its own PR/stack, deliberately NOT part of any single PR
+(#637 or otherwise).** Documented here so the design is captured.
+
+### Why it's a separate stack (not in #637 or any one binary)
+
+The headline metric is **"tip change → last miner notified"** — the time from a new
+Bitcoin tip to the slowest miner receiving the activating job. Measuring it requires
+**six timestamp points spread across three components**, so they *cannot* live in the
+translator binary (#637) or any single crate even if we wanted them to:
+
+| Timestamp point | Component | Code anchor (approx) |
+|---|---|---|
+| block notification received | **node** (IPC) | `ipc.rs::ipc_block_listener` (`TipChanged`) |
+| template built | **node** | `lib.rs::ipc_template_consumer` (BraidpoolTemplate built) |
+| job sent to first / last miner | **pool fan-out / translator** | `pool …channel_manager` `NewExtendedMiningJob` send; translator SV1 `mining.notify` |
+| share received | **pool** | `mining_message_handler::SubmitSharesExtended` |
+| share validated | **pool** | `extended_channel.validate_share` → `ValidatedShare` |
+| bead broadcast | **node** | `main.rs` share-bridge consumer → `propagate_valid_bead` (once wired) |
+
+Because the points span node + pool + translator, the instrumentation is a
+cross-cutting observability workstream, not a feature of any one PR.
+
+### What it is: the SV2/stratum twin of the P2P propagation harness
+
+This is the miner↔pool analogue of the node↔node bead-propagation-latency harness
+(see `propagation-latency-harness.md`). Same shape:
+
+- **Join key:** `template_id`, which already threads end-to-end
+  (`BraidpoolTemplate.template_id` → `ValidatedShare.template_id`). No wire-format
+  change needed — emit structured log events keyed by `template_id`, join offline.
+- **Metric:** report `p50` and `p99` of each segment and of the full
+  tip→last-miner path, at **N = 100, 1,000, 10,000** miners, driven by the load
+  generator (PR #659's JMeter + cpuminer threads).
+- **Clock skew:** MVP on a **single host** (skew = 0, exact); add chrony/PTP only
+  when scaling cross-host. Identical discipline to the p2p harness §3.
+
+### Hooks that already exist (scaffolding in place)
+
+- `BeadContext.received_at: Instant` (sv2-apps #2) — the pool-side "template
+  received" timestamp hook; its doc comment already names latency measurement as
+  the purpose. Currently `BeadContext` is unused scaffolding kept for exactly this.
+- `BraidpoolTemplate.header_timestamp` and the `template_id` threading give the
+  correlation spine.
+
+### Why it matters (consensus link)
+
+Job-dispatch latency is consensus-relevant: a miner hashing a stale job produces
+stale shares, which directly degrade EDCA payout accuracy, and slower propagation
+widens cohorts (the spec's cohort-size ceiling x₀ depends on network latency `a`).
+So "tip → last miner notified < bead interval" is a correctness target, not just ops.
+
+### Sequencing
+
+Land **after** the core SV2 path (#1/#2/#561/#637) and the share→bead wiring are
+stable, so the six hook points don't move under it. Then: (A) structured log events
+behind a flag → (B) offline collector computing the percentiles → (C) optional
+Prometheus for production. A before B before C; A's event schema is the contract.
