@@ -96,6 +96,86 @@ let outputs_to_include: Vec<_> = if braidpool_mode {
 
 The pool's `factory.rs` then uses these outputs directly as `coinbase_tx_prefix` for downstream miners. This means the OP_RETURN commitment travels in the coinbase outputs, which are part of `coinbase_tx_suffix` in the serialized transaction (outputs come after inputs). The `NewTemplate` message carries `coinbase_tx_outputs` separately as a field — this is TDP-specific and not the same as the Extended Channel's `coinbase_tx_prefix`/`coinbase_tx_suffix` split. The factory handles the reassembly.
 
+#### ⚠️ Coinbase value/outputs DOUBLING bug 
+ review of sv2-apps #1 found a real protocol-correctness bug, confirmed in code:
+
+- **TP side** (`sv2_messages.rs::build_new_template`): sets
+  `coinbase_tx_value_remaining = sum(all outputs)` (the full reward) **and** ships
+  all of those same outputs in `coinbase_tx_outputs`.
+- **Pool side** (`channel_manager/template_distribution_message_handler.rs:50,60`):
+  `coinbase_output[0].value = msg.coinbase_tx_value_remaining` and builds the pool's
+  **own** payout output from it (`PayoutMode::coinbase_outputs(value_remaining, reward_script)`),
+  while the job *also* carries the template's `coinbase_tx_outputs`.
+- **Result:** the reward is counted twice — a pool payout output worth the full
+  reward **plus** the node's full coinbase outputs. Invalid coinbase.
+
+This is the **same root cause** as mstrr's "single-output assumption" point: the
+pool's model (one output valued at `value_remaining` via a single
+`coinbase_reward_script`) can't express EDCA's multi-output payout. braidpool_mode's
+"ship all outputs" is the intended multi-output path, but it collides with the
+pool synthesizing its own output.
+
+**Fix — a Braidpool payout mode. ✅ IMPLEMENTED in #2, commit `722518a8` (3 files):**
+1. **`stratum-apps/src/payout.rs`:** `PayoutMode::Braidpool` whose `coinbase_outputs()`
+   returns **`vec![]`** — the pool adds no output of its own; the node's
+   `coinbase_tx_outputs` are the complete set. Pool-selected only (deliberately **not**
+   parseable from a miner's `user_identity`).
+2. **Pool activation (`channel_manager`):** a `braidpool_mode` flag set from
+   `TemplateProviderType::BraidpoolIpc`; a `resolve_payout_mode()` helper returns
+   `Braidpool` for every downstream when in braidpool mode, ignoring identity.
+3. **No handler rewrite needed:** the template handler already builds the coinbase via
+   `payout_mode.coinbase_outputs()`, so once the mode is `Braidpool` (empty) the pool
+   contributes nothing → no doubling. `coinbase_tx_value_remaining` becomes dead for
+   braidpool downstreams.
+
+**#3 was folded into #2** (one PR), not a separate PR — the activation needs #2's
+`BraidpoolIpc` signal, so they belong together.
+
+**Still a #1 follow-up:** the TP should set `coinbase_tx_value_remaining = 0` in
+braidpool_mode (cleanliness — the field should honestly read 0). It couldn't land in
+#1 alone: with the old pool behavior `value_remaining = 0` would leave a **0-value pool
+output**. Now that the pool-side fix is in, flipping it is safe anytime. → EDCA
+multi-output payouts (`edca-payouts.md` §3 `build_payout_distribution`) depend on this
+path being correct.
+
+**Also fixed in #1 from the same review (quick, landed):**
+- `changed()` now handles the `Err` case (watch sender dropped) — graceful shutdown
+  with a warning instead of silently stalling the consumer.
+- `Cargo.lock` regenerated to include `braidpool-common` + `braidpool-template-provider`
+  (the PR added workspace members without updating the lockfile → `--locked` CI fail).
+
+#### Worked example (why it's critical, not cosmetic)
+
+3.125 BTC subsidy + 0.1 BTC fees = 3.225 BTC available.
+- Template outputs pay **3.225 BTC** to miners via EDCA.
+- `value_remaining` also says **3.225 BTC**.
+- Pool handler adds its own output of **3.225 BTC**.
+- Coinbase pays **6.45 BTC** > allowed → **block rejected as invalid**.
+
+Miners can still submit shares, so nothing looks wrong until a real block is found
+and rejected. Same issue Copilot flagged in Sept 2025 as "coinbase value/outputs
+semantics" — **marked resolved without being fixed**.
+
+#### Remaining follow-ups (after the pool-side fix)
+
+1. **TP `coinbase_tx_value_remaining = 0`** in braidpool_mode (#1) — small and safe now
+   that the pool adds nothing; remove the `196e38b` TODO in the same commit.
+2. **Regtest test: Bitcoin Core accepts a braidpool-mode block.** This is the real proof
+   the doubling is gone. It's also the **only** enforcement that outputs stay within
+   subsidy + fees — ⚠️ *correction to the earlier "add a trust check" idea:* the pool
+   **can't** do a `sum ≤ subsidy+fees` assertion, because it only gets the outputs +
+   merkle path, not the fee breakdown, so it can't recompute fees. Core validating the
+   real block is the check.
+3. **Witness commitment output** — preserved automatically (the pool passes through the
+   node's full outputs, which include it); the regtest test confirms it.
+4. **Coinbase size.** EDCA → potentially hundreds of outputs → larger coinbase and every
+   job. Check the ~500-output bitcoind limit via IPC and how output count interacts with
+   job size / extranonce (§7). **Reconcile with EDCA's node-side `MAX_PAYOUT_OUTPUTS = 64`**
+   (`edca-payouts.md` §3) — is 64 deliberate or a placeholder vs the ~500 limit?
+5. **Recompute per template.** Fees change each template, so the node must recompute
+   payouts on **every template change**, not only on new beads. Confirm the coinbase
+   sent always matches the template's current fees.
+
 ### 4.3 BeadContext and Schnorr keys in SwarmHandler
 
 `SwarmHandler::new()` now takes `auth_key_secret: Secp256k1SecretKey` and `auth_key_public: Secp256k1PublicKey`. This fixes audit finding 10 — the hardcoded placeholder key. The authority keypair from the Noise handshake flows into bead commitment signing.

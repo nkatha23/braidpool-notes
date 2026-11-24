@@ -27,15 +27,40 @@ miner.
 
 **What it is:** The roadmap notes that coinbase size limits must be measured from
 real hardware. The committed metadata (parent bead hashes, UHPO commitment,
-payout pubkey) grows with every new feature. No current guard prevents the
-coinbase from exceeding the 100kB Bitcoin consensus limit in pathological cases.
+payout pubkey) grows with every new feature, and EDCA adds up to
+`MAX_PAYOUT_OUTPUTS = 64` payout outputs. No current guard checks the **total**
+coinbase size.
 
 **Why it matters to stratum:** Stratum constructs the coinbase template and
-communicates `coinbase1`/`coinbase2` to miners. If committed metadata pushes the
-coinbase over the limit, miners will submit beads that are consensus-invalid.
+communicates `coinbase1`/`coinbase2` to miners. If committed metadata / payout
+outputs push the coinbase over what a miner's hardware accepts, miners submit
+beads that are invalid or are rejected by the unit. There is **no tight Bitcoin
+consensus coinbase limit** — the binding constraints are block weight (4M WU),
+~100 kB standardness, and most importantly the **per-device hardware limit**,
+which is unknown and is exactly what v0.1 data gathering must measure.
 
-**Touches:** `stratum.rs` — coinbase construction block; needs a size assertion
-before issuing `mining.notify`.
+**What already exists (verified against dev, 2026-11-24):** component-level guards
+only — `MAX_OP_RETURN_DATA = 80`, `MAX_COINBASE_SCRIPT_SIG = 100`,
+`MAX_BRAIDPOOL_COMMITMENT_LEN = 72`, `MAX_EXTRANONCE_LEN = 32` in
+`template_creator.rs`. The SV2 path has a `B064K` (64 kB) field cap in sv2-apps #1
+`build_new_template`. EDCA #607 caps the payout **output count** at 64. **None** is
+a total-coinbase-byte assert or a per-job size log. A2 is unbuilt in every PR and
+on dev.
+
+**Where it should live:** the coinbase is built in
+**`template_creator.rs::build_braidpool_coinbase_from_template`** (not `stratum.rs`,
+which only *splits* it into `coinbase1`/`coinbase2` for `mining.notify` ~L2377).
+Put the measure + guard once in `template_creator.rs` so it covers **both** the
+native stratum path and the SV2 path, rather than duplicating.
+
+**Approach (v0.1, connection-limit-shaped like #657):**
+1. `let size = serialize(&coinbase).len();` and `info!` it per job — the actual
+   data-gathering deliverable, so operators report what their hardware accepts.
+2. A `MAX_COINBASE_SIZE` const + optional `--max-coinbase-size` CLI arg
+   (conservative default), asserted/warned before the job is issued.
+3. Reconcile with EDCA: at 64 outputs the coinbase is ~2–3 kB (safe today); this
+   guard becomes the real backstop once `MAX_PAYOUT_OUTPUTS` is raised toward the
+   ~500 bitcoind output limit. See `sv2-integration.md` §4.2 and `edca-payouts.md` §3.
 
 ### A3. Miner Error Rate Tracking
 
